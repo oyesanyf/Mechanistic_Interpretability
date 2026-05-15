@@ -44,6 +44,8 @@ import sys
 import warnings
 import time
 import traceback
+import threading
+import itertools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from contextlib import contextmanager
@@ -1091,6 +1093,39 @@ def save_artifacts_threaded(
         print(f"                     : {out_dir / 'summary_best_awakening_gain_by_condition.png'}")
 
 # ---------------------------------------------------------------------------
+# Visual feedback
+# ---------------------------------------------------------------------------
+class Spinner:
+    """Simple thread-based console spinner for long-running operations."""
+    def __init__(self, message: str = "Processing", delay: float = 0.1):
+        self.message = message
+        self.delay = delay
+        self.spinner = itertools.cycle(['-', '/', '|', '\\'])
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+
+    def _spin(self):
+        while self.running:
+            sys.stdout.write(f"\r  {self.message}... {next(self.spinner)}")
+            sys.stdout.flush()
+            time.sleep(self.delay)
+
+    def __enter__(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._spin, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=0.5)
+        # Clear the spinner line
+        sys.stdout.write("\r" + " " * (len(self.message) + 20) + "\r")
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
 # Console tee
 # ---------------------------------------------------------------------------
 class Tee:
@@ -1192,16 +1227,17 @@ def main() -> None:
     print(f"Timestamped run folder : {out_dir}")
 
     print("\n[1] Loading tokenizer and model...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    load_kwargs = {"dtype": dtype, "trust_remote_code": True}
-    if device == "cuda":
-        load_kwargs["device_map"] = "auto"
-    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
-    if device in {"cpu", "mps"}:
-        model.to(device)
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad_(False)
+    with Spinner("Loading"):
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        load_kwargs = {"dtype": dtype, "trust_remote_code": True}
+        if device == "cuda":
+            load_kwargs["device_map"] = "auto"
+        model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+        if device in {"cpu", "mps"}:
+            model.to(device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
 
     layers = find_layers(model)
     if layers is None:
@@ -1261,13 +1297,18 @@ def main() -> None:
                     fragility_auditor = SafetyFragilityAuditor(model, tokenizer, layers, probe_indices, device)
                     cal_prompts = calibration_prompts_for_language(language, args.n_calibration, scaffold)
                     print(f"  Calibrating Part A  : {len(cal_prompts)} prompts...", end=" ", flush=True)
-                    fragility_auditor.calibrate(cal_prompts)
+                    with Spinner("Working"):
+                        fragility_auditor.calibrate(cal_prompts)
                     print("done")
 
                 for prompt_kind, categories in prompt_plan:
                     print(f"\n    Prompt kind: {prompt_kind}")
-                    for pi, category in enumerate(categories):
-                        prompt_text = build_prompt(language, category, pi, prompt_kind, scaffold)
+                    if args.compact_console:
+                        print(f"      Processing {len(categories)} prompts", end=" ", flush=True)
+
+                    with Spinner("Running audit") if args.compact_console else contextmanager(lambda: (yield))():
+                        for pi, category in enumerate(categories):
+                            prompt_text = build_prompt(language, category, pi, prompt_kind, scaffold)
                         inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
                         if not args.compact_console:
                             print(f"      prompt {pi + 1:02d}/{len(categories):02d} {category[:46]:<46}")
