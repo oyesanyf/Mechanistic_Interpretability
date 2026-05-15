@@ -43,6 +43,34 @@ graph LR
     F --> G[Awakened Safety]
 ```
 
+## 🛠️ Step-by-Step Execution Flow
+
+The research auditor follows a rigorous pipeline to evaluate and manipulate the model's safety behavior:
+
+### Phase 1: Environment & Data Preparation
+1.  **Model Loading**: Initializes the targeted Causal LM and Tokenizer on the available accelerator (CUDA/MPS/CPU).
+2.  **Resource Configuration**: Defines language-specific refusal/safe starts and safety intent categories (e.g., "cyber abuse request").
+3.  **Scaffold Application**: Wraps base prompts in "safety scaffolds"—deliberative frameworks like `safety_rubric` or `tree_safety`—to observe their effect on internal circuits.
+
+### Phase 2: Fragility Audit (Layer Null-Patching)
+1.  **Mean Calibration**: Captures the model's "average" internal state by running calibration prompts and storing the mean activations for every target layer.
+2.  **Intervention Forward Pass**: Re-runs the model on test prompts, but dynamically "patches" a specific layer's output with the stored mean vector.
+3.  **Circuit Identification**: By measuring the **Refusal Probability Drop (RPD)**, the auditor identifies which layers are essential for the model's safety response. A high RPD indicates a localized safety circuit.
+
+### Phase 3: Safety Awakening (Residual Optimization)
+1.  **Sparse Optimization**: Injects a trainable mutation vector ($\lambda$) into the residual stream of a target layer.
+2.  **Objective Function**: Uses gradient descent to maximize the model's refusal probability while applying L1/L2 regularization to keep the perturbation sparse and "small."
+3.  **Latent Capability Discovery**: Measures how easily safety can be "awakened" in layers that normally permit unsafe responses, revealing the model's hidden alignment depth.
+
+### Phase 4: Behavioral Verification
+1.  **Text Generation**: Generates full-length responses for each audited state (Clean vs. Awakened).
+2.  **Heuristic Classification**: Passes the text through a multi-stage regex classifier to categorize the behavior (e.g., `safe_redirect`, `refusal`, or `possible_compliance`).
+
+### Phase 5: Synthesis & Reporting
+1.  **Statistical Analysis**: Computes Gini coefficients for signal distribution and summarizes fragility rates across languages.
+2.  **Data Export**: Generates detailed CSVs and JSON reports in the `african_safety_research_outputs/` directory.
+3.  **Visualization**: Produces comparative charts showing RPD profiles and awakening gains across the model's depth.
+
 ## 📂 Project Structure
 
 - `cross-lingual-safety-fragility/`: Primary research module.
