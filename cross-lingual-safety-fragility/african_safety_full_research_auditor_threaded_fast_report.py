@@ -233,6 +233,35 @@ class AwakeningResult:
 
 
 @dataclass
+class ChainOfThought:
+    """Step-by-step reasoning trace recorded for every evaluated prompt.
+
+    This is a *visible* audit log, not a hidden model CoT extraction.
+    It records the decisions and measurements taken by the auditor for
+    each prompt so the researcher can review exactly how every number
+    was produced.
+    """
+    prompt_id: int = 0
+    language: str = ""
+    scaffold: str = ""
+    prompt_kind: str = ""
+    category: str = ""
+    steps: list[str] = field(default_factory=list)
+
+    def log(self, step: str) -> None:
+        self.steps.append(step)
+
+    def as_text(self) -> str:
+        lines = [
+            f"Chain-of-Thought for Prompt {self.prompt_id} | {self.language} / {self.scaffold} / {self.prompt_kind} / {self.category}",
+            "-" * 80,
+        ]
+        for i, step in enumerate(self.steps, start=1):
+            lines.append(f"  Step {i:02d}: {step}")
+        return "\n".join(lines)
+
+
+@dataclass
 class GenerationEval:
     enabled: bool = False
     generated_text: str = ""
@@ -270,6 +299,7 @@ class CombinedPromptResult:
     best_awakening: Optional[AwakeningResult] = None
     generation_eval: GenerationEval = field(default_factory=GenerationEval)
     warning_flags: list[str] = field(default_factory=list)
+    chain_of_thought: ChainOfThought = field(default_factory=ChainOfThought)
 
 
 @dataclass
@@ -973,7 +1003,7 @@ def save_prompt_details(results: list[CombinedPromptResult], path: Path) -> None
             "mean_clean_refusal_prob", "max_clean_refusal_prob", "peak_entropy_increase", "peak_english_refusal_increase",
             "best_awakening_layer", "best_awakened_refusal_prob", "best_safety_awakening_gain", "best_mutation_l2",
             "best_mutation_norm_label", "all_awakening_results_json", "generation_behavior_label", "generated_text",
-            "refusal_pieces_per_start", "warning_flags", "prompt_text"
+            "refusal_pieces_per_start", "warning_flags", "prompt_text", "cot_steps_json"
         ])
         for item in results:
             best = item.best_awakening
@@ -986,6 +1016,7 @@ def save_prompt_details(results: list[CombinedPromptResult], path: Path) -> None
                 json.dumps([asdict(x) for x in item.awakening_results], ensure_ascii=False),
                 item.generation_eval.behavior_label, item.generation_eval.generated_text.replace("\n", "\\n"),
                 item.refusal_pieces_per_start, " | ".join(item.warning_flags), item.prompt_text.replace("\n", "\\n"),
+                json.dumps(item.chain_of_thought.steps, ensure_ascii=False),
             ])
 
 
@@ -1013,6 +1044,14 @@ def save_summary(summaries: list[CombinedSummary], path: Path) -> None:
 
 
 def save_json(results: list[CombinedPromptResult], summaries: list[CombinedSummary], path: Path) -> None:
+    def result_to_dict(item: CombinedPromptResult) -> dict:
+        d = asdict(item)
+        # chain_of_thought is saved separately in the CoT log file; keep only a brief reference
+        cot = d.pop("chain_of_thought", None)
+        if cot:
+            d["chain_of_thought_steps"] = cot.get("steps", [])
+        return d
+
     payload = {
         "method": {
             "part_a": "Safety fragility via mean null-patching.",
@@ -1022,7 +1061,7 @@ def save_json(results: list[CombinedPromptResult], summaries: list[CombinedSumma
             "controls": "Optional English control and benign prompt controls.",
             "scaffold_note": "Visible safety scaffolds only; no hidden chain-of-thought extraction.",
         },
-        "prompt_results": [asdict(x) for x in results],
+        "prompt_results": [result_to_dict(x) for x in results],
         "summaries": [asdict(x) for x in summaries],
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1108,54 +1147,113 @@ def save_markdown_report(summaries: list[CombinedSummary], out_dir: Path, run_me
 
 
 
-def save_word_report(summaries: list[CombinedSummary], out_dir: Path, run_metadata: dict) -> Optional[Path]:
-    """Create a human-readable Word .docx research report in the run folder.
+def _doc_add_text_block(doc, title: str, text: str, max_chunk: int = 1800) -> None:
+    """Add long text safely to a Word document in readable chunks."""
+    doc.add_paragraph(title)
+    if text is None:
+        doc.add_paragraph("<None>")
+        return
+    text = str(text)
+    if not text:
+        doc.add_paragraph("<empty>")
+        return
+    for i in range(0, len(text), max_chunk):
+        doc.add_paragraph(text[i:i + max_chunk])
 
-    This report is intentionally compact: it gives the executive summary,
-    summary table, interpretation notes, embedded charts when available, and a
-    list of files created. The raw CSV/JSON remain the source of truth.
+
+def _safe_cell_text(value) -> str:
+    """Word table cells should receive short plain strings."""
+    if value is None:
+        return ""
+    text = str(value)
+    return text[:5000]
+
+
+def save_word_report(
+    results: list[CombinedPromptResult],
+    summaries: list[CombinedSummary],
+    out_dir: Path,
+    run_metadata: dict,
+    run_log_path: Optional[Path] = None,
+    cot_log_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Create a full-detail Word .docx audit report in the run folder.
+
+    This is intentionally detailed. It includes the summary plus the raw
+    prompt-level evidence used to arrive at the findings: every language,
+    scaffold, seed, prompt kind, prompt category, prompt text, refusal-token
+    probes, layer-patching results, awakening results, generated output,
+    behavior labels, and warnings. The CSV and JSON are still saved separately
+    and remain the best machine-readable source of truth.
     """
     if not HAS_DOCX:
         print("[SKIP] Word report not saved because python-docx is unavailable. Install with: pip install python-docx")
         return None
 
     ts = run_metadata.get("run_timestamp", "run")
-    path = out_dir / f"research_report_{ts}.docx"
+    path = out_dir / f"FULL_DETAIL_AUDIT_REPORT_{ts}.docx"
     doc = Document()
-    doc.add_heading("African Cross-Lingual Safety Research Report", level=0)
+    doc.add_heading("African Cross-Lingual Safety Research: Full Detail Audit Report", level=0)
 
+    doc.add_paragraph(
+        "This document is designed as a complete human-readable audit trail. "
+        "It includes summary findings and the detailed evidence used to arrive at those findings. "
+        "For machine analysis, use the CSV and JSON files created in the same run folder."
+    )
+
+    # ------------------------------------------------------------------
+    # Run metadata
+    # ------------------------------------------------------------------
+    doc.add_heading("1. Run Metadata", level=1)
     meta = doc.add_table(rows=0, cols=2)
-    for label, value in [
+    meta.style = "Table Grid"
+    metadata_rows = [
         ("Run timestamp", run_metadata.get("run_timestamp", "")),
         ("Model", run_metadata.get("model", "")),
         ("Device", run_metadata.get("device", "")),
         ("Dtype", run_metadata.get("dtype", "")),
         ("Output folder", str(out_dir.resolve())),
-    ]:
+        ("Number of prompt-level records", len(results)),
+        ("Number of summary rows", len(summaries)),
+        ("Run log file", str(run_log_path.resolve()) if run_log_path else "N/A"),
+        ("Chain-of-thought log", str(cot_log_path.resolve()) if cot_log_path else "N/A"),
+        ("CSV/JSON note", "The CSV and JSON files are the machine-readable source of truth; this Word report is the readable audit trail."),
+    ]
+    if "command" in run_metadata:
+        metadata_rows.append(("Command", run_metadata.get("command", "")))
+    for label, value in metadata_rows:
         row = meta.add_row().cells
-        row[0].text = label
-        row[1].text = str(value)
+        row[0].text = str(label)
+        row[1].text = _safe_cell_text(value)
 
-    doc.add_heading("Executive summary", level=1)
+    # ------------------------------------------------------------------
+    # Executive summary
+    # ------------------------------------------------------------------
+    doc.add_heading("2. Executive Summary", level=1)
     if not summaries:
         doc.add_paragraph("No completed summaries were available.")
     else:
         best_gain = max(summaries, key=lambda s: s.mean_safety_awakening_gain_best)
         highest_clean = max(summaries, key=lambda s: s.mean_clean_refusal_prob)
         highest_rpd = max(summaries, key=lambda s: s.mean_peak_rpd)
+        lowest_clean = min(summaries, key=lambda s: s.mean_clean_refusal_prob)
         for line in [
             f"Highest mean clean refusal probability: {highest_clean.language} / {highest_clean.scaffold} / {highest_clean.prompt_kind} = {highest_clean.mean_clean_refusal_prob:.6f}.",
+            f"Lowest mean clean refusal probability: {lowest_clean.language} / {lowest_clean.scaffold} / {lowest_clean.prompt_kind} = {lowest_clean.mean_clean_refusal_prob:.6f}.",
             f"Highest mean peak RPD: {highest_rpd.language} / {highest_rpd.scaffold} / {highest_rpd.prompt_kind} = {highest_rpd.mean_peak_rpd:.6f}.",
             f"Highest mean best awakening gain: {best_gain.language} / {best_gain.scaffold} / {best_gain.prompt_kind} = {best_gain.mean_safety_awakening_gain_best:+.6f}.",
         ]:
             doc.add_paragraph(line, style="List Bullet")
 
-    doc.add_heading("Summary table", level=1)
-    table = doc.add_table(rows=1, cols=9)
+    # ------------------------------------------------------------------
+    # Summary table
+    # ------------------------------------------------------------------
+    doc.add_heading("3. Summary Table by Language / Scaffold / Prompt Kind", level=1)
+    table = doc.add_table(rows=1, cols=12)
     table.style = "Table Grid"
     headers = [
-        "Language", "Scaffold", "Kind", "N", "Clean refusal", "Peak RPD",
-        "Fragility rate", "Best gain", "Mutation L2",
+        "Language", "Scaffold", "Kind", "N", "Seeds", "Mean clean refusal", "Median clean refusal",
+        "Mean peak RPD", "Max peak RPD", "Mean Gini", "Mean best gain", "Mean mutation L2",
     ]
     for i, header in enumerate(headers):
         table.rows[0].cells[i].text = header
@@ -1166,16 +1264,43 @@ def save_word_report(summaries: list[CombinedSummary], out_dir: Path, run_metada
             s.scaffold,
             s.prompt_kind,
             str(s.n_prompts),
+            str(s.n_seeds),
             f"{s.mean_clean_refusal_prob:.6f}",
+            f"{s.median_clean_refusal_prob:.6f}",
             f"{s.mean_peak_rpd:.6f}",
-            f"{s.meaningful_fragility_rate:.1%}",
+            f"{s.max_peak_rpd:.6f}",
+            f"{s.mean_gini_rpd:.6f}",
             f"{s.mean_safety_awakening_gain_best:+.6f}",
             f"{s.mean_mutation_l2_best:.2f}",
         ]
         for i, value in enumerate(values):
             cells[i].text = value
 
-    doc.add_heading("Charts", level=1)
+    # ------------------------------------------------------------------
+    # Summary internals that are often missed in short reports
+    # ------------------------------------------------------------------
+    doc.add_heading("4. Summary Internals: Layer Histograms and Mean Profiles", level=1)
+    for s in summaries:
+        doc.add_heading(f"{s.language} / {s.scaffold} / {s.prompt_kind}", level=2)
+        doc.add_paragraph(
+            f"Meaningful fragility rate: {s.meaningful_fragility_rate:.1%}\n"
+            f"Weak-or-better fragility rate: {s.weak_or_better_fragility_rate:.1%}\n"
+            f"Absent fragility rate: {s.absent_fragility_rate:.1%}\n"
+            f"Modal peak RPD layer: {s.modal_peak_rpd_layer}\n"
+            f"Meaningful awakening rate: {s.meaningful_awakening_rate_best:.1%}\n"
+            f"Weak-or-better awakening rate: {s.weak_or_better_awakening_rate_best:.1%}"
+        )
+        _doc_add_text_block(doc, "Peak layer histogram:", json.dumps(s.peak_layer_histogram, indent=2, ensure_ascii=False))
+        _doc_add_text_block(doc, "Mean RPD profile by layer:", json.dumps(s.mean_profile_by_layer, indent=2, ensure_ascii=False))
+        _doc_add_text_block(doc, "Mean entropy change by layer:", json.dumps(s.mean_entropy_by_layer, indent=2, ensure_ascii=False))
+        _doc_add_text_block(doc, "Best target-layer histogram:", json.dumps(s.best_target_layer_histogram, indent=2, ensure_ascii=False))
+        _doc_add_text_block(doc, "Mean awakening gain by target layer:", json.dumps(s.mean_awakening_gain_by_target_layer, indent=2, ensure_ascii=False))
+        _doc_add_text_block(doc, "Behavior label rates:", json.dumps(s.behavior_label_rates, indent=2, ensure_ascii=False))
+
+    # ------------------------------------------------------------------
+    # Charts
+    # ------------------------------------------------------------------
+    doc.add_heading("5. Charts", level=1)
     chart_paths = [
         out_dir / "summary_clean_refusal_by_condition.png",
         out_dir / "summary_best_awakening_gain_by_condition.png",
@@ -1189,7 +1314,196 @@ def save_word_report(summaries: list[CombinedSummary], out_dir: Path, run_metada
     if not added_chart:
         doc.add_paragraph("No charts were available. Install matplotlib and numpy to generate charts.")
 
-    doc.add_heading("Interpretation notes", level=1)
+    # ------------------------------------------------------------------
+    # Full prompt-level audit trace
+    # ------------------------------------------------------------------
+    doc.add_heading("6. Full Prompt-Level Audit Trace: Every Language and Every Test", level=1)
+    doc.add_paragraph(
+        "Each record below is one evaluated prompt condition. It includes the raw prompt, refusal-token setup, "
+        "all layer patching results, all awakening results, generated output, classifier label, and warnings."
+    )
+
+    # Group for readability but do not omit anything.
+    grouped: dict[tuple[str, str, str, int], list[CombinedPromptResult]] = {}
+    for item in results:
+        grouped.setdefault((item.language, item.scaffold, item.prompt_kind, item.seed), []).append(item)
+
+    record_counter = 0
+    for (language, scaffold, prompt_kind, seed), items in sorted(grouped.items()):
+        doc.add_heading(f"{language} / {scaffold} / {prompt_kind} / Seed {seed}", level=2)
+        doc.add_paragraph(f"Records in this section: {len(items)}")
+
+        for item in sorted(items, key=lambda x: x.prompt_id):
+            record_counter += 1
+            doc.add_heading(f"Record {record_counter}: Prompt {item.prompt_id} — {item.category}", level=3)
+
+            overview = doc.add_table(rows=0, cols=2)
+            overview.style = "Table Grid"
+            overview_rows = [
+                ("Language", item.language),
+                ("Resource", item.resource),
+                ("Family", item.family),
+                ("Scaffold", item.scaffold),
+                ("Seed", item.seed),
+                ("Prompt kind", item.prompt_kind),
+                ("Prompt ID", item.prompt_id),
+                ("Category", item.category),
+                ("Refusal token IDs", item.refusal_token_ids),
+                ("Refusal token texts", item.refusal_token_texts),
+                ("Refusal pieces per start", f"{item.refusal_pieces_per_start:.6f}"),
+                ("Peak RPD", f"{item.peak_rpd:.6f}"),
+                ("Peak RPD layer", item.peak_rpd_layer),
+                ("Gini RPD", f"{item.gini_rpd:.6f}"),
+                ("Fragility signal", item.fragility_signal_strength),
+                ("Fragility label", item.fragility_label),
+                ("Mean clean refusal probability", f"{item.mean_clean_refusal_prob:.6f}"),
+                ("Max clean refusal probability", f"{item.max_clean_refusal_prob:.6f}"),
+                ("Peak entropy increase", f"{item.peak_entropy_increase:.6f}"),
+                ("Peak English refusal increase", f"{item.peak_english_refusal_increase:.6f}"),
+            ]
+            for label, value in overview_rows:
+                row = overview.add_row().cells
+                row[0].text = str(label)
+                row[1].text = _safe_cell_text(value)
+
+            _doc_add_text_block(doc, "Prompt text:", item.prompt_text)
+
+            doc.add_paragraph("Layer null-patching / RPD details:")
+            if item.layer_results:
+                layer_table = doc.add_table(rows=1, cols=8)
+                layer_table.style = "Table Grid"
+                layer_headers = [
+                    "Layer", "RPD", "Entropy Δ", "English refusal Δ",
+                    "Refusal clean", "Refusal patched", "English clean", "English patched",
+                ]
+                for i, header in enumerate(layer_headers):
+                    layer_table.rows[0].cells[i].text = header
+                for lr in item.layer_results:
+                    cells = layer_table.add_row().cells
+                    values = [
+                        lr.layer_idx,
+                        f"{lr.rpd:.6f}",
+                        f"{lr.entropy_increase:.6f}",
+                        f"{lr.english_refusal_increase:.6f}",
+                        f"{lr.refusal_prob_clean:.6f}",
+                        f"{lr.refusal_prob_patched:.6f}",
+                        f"{lr.english_refusal_prob_clean:.6f}",
+                        f"{lr.english_refusal_prob_patched:.6f}",
+                    ]
+                    for i, value in enumerate(values):
+                        cells[i].text = str(value)
+            else:
+                doc.add_paragraph("No layer null-patching results were recorded for this item.")
+
+            doc.add_paragraph("Awakening details:")
+            if item.awakening_results:
+                aw_table = doc.add_table(rows=1, cols=11)
+                aw_table.style = "Table Grid"
+                aw_headers = [
+                    "Target layer", "Clean refusal", "Awakened refusal", "Gain",
+                    "Clean entropy", "Awakened entropy", "Entropy Δ",
+                    "Mutation L1", "Mutation L2", "Mutation L∞", "Label",
+                ]
+                for i, header in enumerate(aw_headers):
+                    aw_table.rows[0].cells[i].text = header
+                for aw in item.awakening_results:
+                    cells = aw_table.add_row().cells
+                    values = [
+                        aw.target_layer,
+                        f"{aw.clean_refusal_prob:.6f}",
+                        f"{aw.awakened_refusal_prob:.6f}",
+                        f"{aw.safety_awakening_gain:+.6f}",
+                        f"{aw.clean_entropy:.6f}",
+                        f"{aw.awakened_entropy:.6f}",
+                        f"{aw.entropy_change:+.6f}",
+                        f"{aw.mutation_l1:.6f}",
+                        f"{aw.mutation_l2:.6f}",
+                        f"{aw.mutation_linf:.6f}",
+                        aw.success_label,
+                    ]
+                    for i, value in enumerate(values):
+                        cells[i].text = str(value)
+                    _doc_add_text_block(doc, f"Top mutation dimensions for target layer {aw.target_layer}:", json.dumps(aw.top_mutation_dims, indent=2, ensure_ascii=False))
+            else:
+                doc.add_paragraph("No awakening results were recorded for this item.")
+
+            if item.best_awakening is not None:
+                best = item.best_awakening
+                doc.add_paragraph("Best awakening selected for this prompt:")
+                doc.add_paragraph(
+                    f"Target layer: {best.target_layer}\n"
+                    f"Clean refusal probability: {best.clean_refusal_prob:.6f}\n"
+                    f"Awakened refusal probability: {best.awakened_refusal_prob:.6f}\n"
+                    f"Safety awakening gain: {best.safety_awakening_gain:+.6f}\n"
+                    f"Mutation L2: {best.mutation_l2:.6f}\n"
+                    f"Mutation norm label: {best.mutation_norm_label}\n"
+                    f"Success label: {best.success_label}"
+                )
+
+            doc.add_paragraph("Generated response evaluation:")
+            doc.add_paragraph(
+                f"Enabled: {item.generation_eval.enabled}\n"
+                f"Behavior label: {item.generation_eval.behavior_label}\n"
+                f"Behavior score notes: {item.generation_eval.behavior_score_notes}"
+            )
+            _doc_add_text_block(doc, "Generated text:", item.generation_eval.generated_text)
+
+            if item.warning_flags:
+                doc.add_paragraph("Warning flags:")
+                for warning in item.warning_flags:
+                    doc.add_paragraph(warning, style="List Bullet")
+            else:
+                doc.add_paragraph("Warning flags: none")
+
+    # ------------------------------------------------------------------
+    # Chain-of-thought audit trace (embedded in Word doc)
+    # ------------------------------------------------------------------
+    doc.add_heading("7. Chain-of-Thought Reasoning Trace", level=1)
+    doc.add_paragraph(
+        "This section records the step-by-step auditor reasoning for every evaluated prompt. "
+        "Each prompt's trace shows how inputs were constructed, what measurements were taken at each layer, "
+        "and what decision was reached. This is a visible audit log — not an extraction of the model's internal chain-of-thought."
+    )
+    for item in results:
+        cot = item.chain_of_thought
+        doc.add_heading(
+            f"CoT: Prompt {cot.prompt_id} | {cot.language} / {cot.scaffold} / {cot.prompt_kind} — {cot.category}",
+            level=3,
+        )
+        for step_num, step_text in enumerate(cot.steps, start=1):
+            doc.add_paragraph(f"Step {step_num:02d}: {step_text}", style="List Number")
+
+    # ------------------------------------------------------------------
+    # Run log (embedded summary — full log is in the .txt file)
+    # ------------------------------------------------------------------
+    doc.add_heading("8. Run Log Summary", level=1)
+    if run_log_path is not None and run_log_path.exists():
+        doc.add_paragraph(f"Full run log path: {run_log_path.resolve()}")
+        doc.add_paragraph(
+            "The run log captures all console output including warnings, errors, "
+            "progress messages, and timing. A summary of the first and last 120 lines is embedded below. "
+            "Open the .txt file for the complete log."
+        )
+        try:
+            log_lines = run_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            head = log_lines[:60]
+            tail = log_lines[-60:] if len(log_lines) > 60 else []
+            preview_lines = head + (["", "... [middle of log omitted — see full .txt file] ...", ""] if tail else []) + tail
+            _doc_add_text_block(doc, "Log preview:", "\n".join(preview_lines))
+        except Exception as exc:
+            doc.add_paragraph(f"[Could not read log file: {exc}]")
+    else:
+        doc.add_paragraph("No run log path was provided or the log file does not yet exist at report generation time.")
+
+    # ------------------------------------------------------------------
+    # Files created
+    # ------------------------------------------------------------------
+    doc.add_heading("9. Files Created", level=1)
+    for file_path in sorted(out_dir.glob("*")):
+        if file_path.is_file():
+            doc.add_paragraph(file_path.name, style="List Bullet")
+
+    doc.add_heading("10. Interpretation Notes", level=1)
     notes = [
         "English/control versus African-language conditions helps separate cross-lingual effects from model-wide behavior.",
         "Benign controls detect over-refusal. A safety intervention that raises refusal on benign prompts is not clean.",
@@ -1201,13 +1515,26 @@ def save_word_report(summaries: list[CombinedSummary], out_dir: Path, run_metada
     for note in notes:
         doc.add_paragraph(note, style="List Bullet")
 
-    doc.add_heading("Files created", level=1)
-    for file_path in sorted(out_dir.glob("*")):
-        if file_path.is_file():
-            doc.add_paragraph(file_path.name, style="List Bullet")
-
     doc.save(path)
     return path
+
+def save_chain_of_thought_log(results: list[CombinedPromptResult], out_dir: Path, ts: str) -> Path:
+    """Write a plain-text chain-of-thought trace log covering every evaluated prompt."""
+    path = out_dir / f"chain_of_thought_{ts}.txt"
+    lines = [
+        "=" * 96,
+        "CHAIN-OF-THOUGHT AUDIT LOG",
+        f"Run timestamp: {ts}",
+        "This file records the step-by-step reasoning trace for every evaluated prompt.",
+        "=" * 96,
+        "",
+    ]
+    for item in results:
+        lines.append(item.chain_of_thought.as_text())
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
 
 def save_artifacts_threaded(
     all_results: list[CombinedPromptResult],
@@ -1215,8 +1542,9 @@ def save_artifacts_threaded(
     out_dir: Path,
     run_metadata: dict,
     save_docx_report: bool = True,
+    run_log_path: Optional[Path] = None,
 ) -> None:
-    """Save CSV, JSON, report, charts, and a manifest.
+    """Save CSV, JSON, report, CoT log, charts, Word doc, and a manifest.
 
     This used to save through a ThreadPoolExecutor. That was fast, but when a
     machine was under memory pressure it made failures harder to see. This
@@ -1240,6 +1568,9 @@ def save_artifacts_threaded(
     report_path = save_markdown_report(summaries, out_dir, run_metadata)
     print(f"Saved Markdown report: {report_path.resolve()}", flush=True)
 
+    cot_log_path = save_chain_of_thought_log(all_results, out_dir, ts)
+    print(f"Saved CoT log        : {cot_log_path.resolve()}", flush=True)
+
     chart_paths = []
     if HAS_MPL:
         save_charts(summaries, out_dir)
@@ -1252,14 +1583,16 @@ def save_artifacts_threaded(
 
     docx_report_path = None
     if save_docx_report:
-        docx_report_path = save_word_report(summaries, out_dir, run_metadata)
+        docx_report_path = save_word_report(all_results, summaries, out_dir, run_metadata, run_log_path=run_log_path, cot_log_path=cot_log_path)
         if docx_report_path is not None:
             print(f"Saved Word report    : {docx_report_path.resolve()}", flush=True)
 
     manifest_path = out_dir / f"RUN_MANIFEST_{ts}.txt"
-    artifact_paths = [prompt_csv, summary_csv, json_path, report_path, *chart_paths]
+    artifact_paths = [prompt_csv, summary_csv, json_path, report_path, cot_log_path, *chart_paths]
     if docx_report_path is not None:
         artifact_paths.append(docx_report_path)
+    if run_log_path is not None and run_log_path.exists():
+        artifact_paths.append(run_log_path)
     manifest_path.write_text(
         "Files created by this run:\n"
         + "".join(f"- {path.resolve()}\n" for path in artifact_paths if path.exists())
@@ -1272,31 +1605,50 @@ def save_artifacts_threaded(
 # Visual feedback
 # ---------------------------------------------------------------------------
 class Spinner:
-    """Simple thread-based console spinner for long-running operations."""
+    """Simple console spinner for interactive terminals only.
+
+    Important: when stdout is Tee-logged to a file, the spinner is disabled.
+    That keeps `tail -f console_output_*.txt` readable and prevents thousands
+    of carriage-return spinner updates from being written into the log.
+    """
     def __init__(self, message: str = "Processing", delay: float = 1.0):
         self.message = message
         self.delay = delay
         self.spinner = itertools.cycle(['-', '/', '|', '\\'])
         self.running = False
         self.thread: Optional[threading.Thread] = None
+        self.enabled = False
+
+    def _should_enable(self) -> bool:
+        if getattr(sys.stdout, "is_tee_logger", False):
+            return False
+        isatty = getattr(sys.stdout, "isatty", None)
+        try:
+            return bool(isatty and isatty())
+        except Exception:
+            return False
 
     def _spin(self):
-        while self.running:
+        while self.running and self.enabled:
             sys.stdout.write(f"\r  {self.message}... {next(self.spinner)}")
             sys.stdout.flush()
             time.sleep(self.delay)
 
     def __enter__(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._spin, daemon=True)
-        self.thread.start()
+        self.enabled = self._should_enable()
+        if self.enabled:
+            self.running = True
+            self.thread = threading.Thread(target=self._spin, daemon=True)
+            self.thread.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.enabled:
+            return
         self.running = False
         if self.thread:
             self.thread.join(timeout=0.5)
-        # Clear the spinner line
+        # Clear the spinner line on the interactive terminal only.
         sys.stdout.write("\r" + " " * (len(self.message) + 20) + "\r")
         sys.stdout.flush()
 
@@ -1305,15 +1657,27 @@ class Spinner:
 # Console tee
 # ---------------------------------------------------------------------------
 class Tee:
+    """Write console output to multiple streams and flush immediately.
+
+    The `is_tee_logger` marker lets Spinner know not to write carriage-return
+    animation into the log file. This makes tailing the log clean and stable.
+    """
+    is_tee_logger = True
+
     def __init__(self, *files):
         self.files = files
+
     def write(self, data):
         for file in self.files:
             file.write(data)
             file.flush()
+
     def flush(self):
         for file in self.files:
             file.flush()
+
+    def isatty(self):
+        return False
 
 
 
@@ -1322,7 +1686,13 @@ def has_cli_flag(*names: str) -> bool:
 
 
 def safe_remove_tree(path: Path, label: str) -> None:
-    """Remove an output/report directory with guardrails against accidents."""
+    """Remove an output/report directory with guardrails and Windows lock handling.
+
+    Windows often leaves folders locked when File Explorer, Word, Excel, VS Code,
+    tail, or a previous Python process still has a file open. Instead of
+    crashing immediately, this retries, then renames the locked folder so the
+    new run can continue with a clean output directory.
+    """
     resolved = path.resolve()
     forbidden = {
         Path("/").resolve(),
@@ -1330,12 +1700,43 @@ def safe_remove_tree(path: Path, label: str) -> None:
         Path.cwd().resolve(),
         Path("/mnt/data").resolve(),
     }
-    if not path.exists():
+    if not resolved.exists():
         return
     if resolved in forbidden or len(str(resolved)) < 8:
         raise RuntimeError(f"Refusing to delete unsafe {label}: {resolved}")
+
     print(f"[CLEANUP] Removing existing {label}: {resolved}", flush=True)
-    shutil.rmtree(resolved)
+    for attempt in range(1, 4):
+        try:
+            shutil.rmtree(resolved)
+            print(f"[CLEANUP] Removed {label}.", flush=True)
+            return
+        except PermissionError as exc:
+            print(
+                f"[CLEANUP WARN] Attempt {attempt}/3 could not remove {label}; "
+                f"a file or folder is still in use: {exc}",
+                flush=True,
+            )
+            time.sleep(2)
+
+    locked_name = resolved.with_name(
+        resolved.name + "_LOCKED_OLD_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+    try:
+        os.rename(resolved, locked_name)
+        print(
+            f"[CLEANUP WARN] Could not delete locked {label}; renamed it instead: {locked_name}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[CLEANUP WARN] Could not delete or rename locked {label}: {exc}",
+            flush=True,
+        )
+        print(
+            "[CLEANUP WARN] Continuing without deleting it. Use a fresh --out_dir if you need a completely clean folder.",
+            flush=True,
+        )
 
 def get_out_dir_from_argv(default: str = "african_safety_research_outputs") -> Path:
     args = sys.argv[1:]
@@ -1382,7 +1783,7 @@ def parse_args():
     parser.add_argument("--clean_run_dir", action="store_true", help="Delete only the resolved current run folder before starting this run.")
     parser.add_argument("--no_word_report", action="store_true", help="Skip the Word .docx report even when python-docx is installed.")
     parser.add_argument("--no_timestamp_run_dir", action="store_true", help="Do not create a timestamped run subfolder")
-    parser.add_argument("--compact_console", action="store_true", default=True, help="Print compact progress to avoid screen lock/freezing")
+    parser.add_argument("--compact_console", action="store_true", default=False, help="Print compact progress to avoid screen lock/freezing")
     parser.add_argument("--full_console", dest="compact_console", action="store_false", help="Print detailed progress")
     parser.add_argument("--heartbeat_seconds", type=float, default=10.0, help="Minimum seconds between progress heartbeat messages")
     return parser.parse_args()
@@ -1396,12 +1797,8 @@ def main() -> None:
     run_timestamp = os.environ.get("AUDITOR_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
     base_out_dir = Path(args.out_dir)
     out_dir = base_out_dir if args.no_timestamp_run_dir else base_out_dir / f"run_{run_timestamp}"
-    # Cleanup is normally handled in the __main__ logging block before logs are opened.
-    # This fallback keeps main() safe if it is called directly from another script.
-    if args.clean_out_dir and not out_dir.exists():
-        safe_remove_tree(base_out_dir, "base output folder")
-    elif args.clean_run_dir and not out_dir.exists():
-        safe_remove_tree(out_dir, "current run folder")
+    # Cleanup is handled in the __main__ logging block before logs are opened.
+    # Do not clean again here; a second cleanup can truncate/delete a log while tailing it.
     out_dir.mkdir(parents=True, exist_ok=True)
     languages = select_languages(args.languages)
     scaffolds = select_scaffolds(args.prompt_scaffolds)
@@ -1524,14 +1921,30 @@ def main() -> None:
                             if not args.compact_console:
                                 print(f"      prompt {pi + 1:02d}/{len(categories):02d} {category[:46]:<46}")
 
+                            # ---- Chain-of-thought trace for this prompt ----
+                            cot = ChainOfThought(
+                                prompt_id=pi,
+                                language=language["name"],
+                                scaffold=scaffold,
+                                prompt_kind=prompt_kind,
+                                category=category,
+                            )
+                            cot.log(f"Prompt built. Scaffold={scaffold!r}, kind={prompt_kind!r}, category={category!r}")
+                            cot.log(f"Prompt length={len(prompt_text)} chars, token count≈{inputs['input_ids'].shape[1]}")
+                            cot.log(f"Refusal token IDs={refusal_ids}, refusal texts={refusal_texts}, pieces/start={pieces_per_start:.3f}")
+                            if pieces_per_start > 2.5:
+                                cot.log("NOTE: Refusal starts are heavily fragmented by the tokenizer. Refusal probability may be underestimated.")
+
                             layer_results: list[LayerFragilityResult] = []
                             if fragility_auditor is not None:
                                 if not args.compact_console:
                                     print("        Part A fragility :", end=" ", flush=True)
+                                cot.log("Part A: Running null-patching fragility probe across all probe layers.")
                                 layer_results = fragility_auditor.probe_all_layers(inputs, refusal_ids, english_ids)
                                 if not args.compact_console:
                                     print("." * len(layer_results), end="", flush=True)
                                     print(" done")
+                                cot.log(f"Part A: Probed {len(layer_results)} layers. Layer RPDs: {[(lr.layer_idx, round(lr.rpd, 6)) for lr in layer_results]}")
 
                             (peak_rpd, peak_layer, gini_rpd, fragility_signal, fragility_label,
                              mean_clean, max_clean, peak_entropy, peak_english, flags) = summarize_fragility(layer_results)
@@ -1540,11 +1953,18 @@ def main() -> None:
                                 mean_clean, _ = probability_and_entropy(model, inputs, refusal_ids)
                                 max_clean = mean_clean
 
+                            cot.log(
+                                f"Part A summary: peak_rpd={peak_rpd:.6f} at layer {peak_layer}, "
+                                f"gini={gini_rpd:.6f}, signal={fragility_signal!r}, label={fragility_label!r}, "
+                                f"mean_clean_refusal={mean_clean:.6f}, max_clean_refusal={max_clean:.6f}"
+                            )
+
                             awakening_results: list[AwakeningResult] = []
                             best_awakening = None
                             if not args.skip_awakening:
                                 if not args.compact_console:
                                     print("        Part B awakening :", end=" ", flush=True)
+                                cot.log(f"Part B: Running safety awakening optimization over target layers: {target_layers}")
                                 for target_layer in target_layers:
                                     awakener = SafetyAwakener(model, layers, target_layer, device, d_model, args.mutation_scale)
                                     aw = awakener.optimize(
@@ -1558,12 +1978,23 @@ def main() -> None:
                                         verbose=args.verbose_awakening,
                                     )
                                     awakening_results.append(aw)
+                                    cot.log(
+                                        f"  Layer {target_layer}: clean_refusal={aw.clean_refusal_prob:.6f}, "
+                                        f"awakened_refusal={aw.awakened_refusal_prob:.6f}, "
+                                        f"gain={aw.safety_awakening_gain:+.6f}, L2={aw.mutation_l2:.3f}, "
+                                        f"label={aw.success_label!r}"
+                                    )
                                     if not args.compact_console:
                                         print(f"L{target_layer}:gain={aw.safety_awakening_gain:+.4f}/l2={aw.mutation_l2:.2f} ", end="", flush=True)
                                 if not args.compact_console:
                                     print("")
                                 if awakening_results:
                                     best_awakening = max(awakening_results, key=lambda x: x.safety_awakening_gain)
+                                    cot.log(
+                                        f"Part B: Best awakening selected at layer {best_awakening.target_layer} "
+                                        f"with gain={best_awakening.safety_awakening_gain:+.6f}, "
+                                        f"norm_label={best_awakening.mutation_norm_label!r}"
+                                    )
                                     if not layer_results:
                                         mean_clean = best_awakening.clean_refusal_prob
                                         max_clean = best_awakening.clean_refusal_prob
@@ -1573,6 +2004,13 @@ def main() -> None:
                                 generation_eval = generate_and_classify(model, tokenizer, prompt_text, device, args.generation_max_new_tokens)
                                 if not args.compact_console:
                                     print(f"        Generation eval : {generation_eval.behavior_label} | {generation_eval.generated_text[:90]!r}")
+                                cot.log(
+                                    f"Generation eval: behavior={generation_eval.behavior_label!r}, "
+                                    f"notes={generation_eval.behavior_score_notes!r}, "
+                                    f"generated_text={generation_eval.generated_text[:120]!r}"
+                                )
+                            else:
+                                cot.log("Generation eval: skipped (--run_generation_eval not set).")
 
                             if pieces_per_start > 2.5:
                                 flags.append("Refusal starts are heavily fragmented by tokenizer.")
@@ -1580,6 +2018,20 @@ def main() -> None:
                                 flags.append("Benign control has meaningful refusal probability; possible over-refusal.")
                             if best_awakening and best_awakening.mutation_norm_label.startswith("large"):
                                 flags.append("Best awakening used large mutation norm; interpret as possible brute-force steering.")
+
+                            if flags:
+                                cot.log(f"Warning flags raised: {flags}")
+                            else:
+                                cot.log("No warning flags raised.")
+
+                            cot.log(
+                                f"FINAL DECISION: CleanRef={mean_clean:.6f}, PeakRPD={peak_rpd:.6f}, "
+                                f"Fragility={fragility_signal!r}, "
+                                + (f"BestAwake=L{best_awakening.target_layer} gain={best_awakening.safety_awakening_gain:+.6f}" if best_awakening else "No awakening result.")
+                            )
+
+                            # Print the CoT trace to the log so tail -f shows it
+                            print(cot.as_text(), flush=True)
 
                             item = CombinedPromptResult(
                                 language=language["name"], resource=language["resource"], family=language["family"],
@@ -1591,6 +2043,7 @@ def main() -> None:
                                 peak_entropy_increase=peak_entropy, peak_english_refusal_increase=peak_english,
                                 layer_results=layer_results, awakening_results=awakening_results,
                                 best_awakening=best_awakening, generation_eval=generation_eval, warning_flags=flags,
+                                chain_of_thought=cot,
                             )
                             all_results.append(item)
                             best_txt = ""
@@ -1620,9 +2073,11 @@ def main() -> None:
         "model": args.model,
         "device": device,
         "dtype": str(dtype),
+        "command": " ".join(sys.argv),
     }
-    print("\n[Saving] Writing CSV, JSON, Markdown report, and charts with threaded artifact writers...")
-    save_artifacts_threaded(all_results, summaries, out_dir, run_metadata)
+    print("\n[Saving] Writing CSV, JSON, Markdown report, CoT log, and charts with threaded artifact writers...")
+    run_log_path_for_save = out_dir / f"run_log_{run_timestamp}.txt"
+    save_artifacts_threaded(all_results, summaries, out_dir, run_metadata, save_docx_report=not args.no_word_report, run_log_path=run_log_path_for_save)
 
     print("\nINTERPRETATION NOTES")
     print("- English/control vs African-language conditions helps separate cross-lingual effects from model-wide behavior.")
@@ -1633,20 +2088,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # -----------------------------------------------------------------------
-    # Robust console-to-file logging
-    # -----------------------------------------------------------------------
-    # This writes everything printed by this script to BOTH the terminal and
-    # log files. It creates the output folder BEFORE loading the model, so even
-    # if the model crashes, you still get a console log and STARTED marker.
-    #
-    # By default, files go here:
-    #   african_safety_research_outputs/run_YYYYMMDD_HHMMSS/
-    #
-    # Example:
-    #   python african_safety_full_research_auditor_FIXED.py --out_dir african_safety_combined_outputs
-    # -----------------------------------------------------------------------
-
+    # Single-file logging only:
+    #   - exactly one run log inside the resolved run folder
+    #   - no RUN_STARTED marker
+    #   - no console_output_latest.txt
+    #   - append mode + line buffering so `tail -f` works while the run is active
     run_timestamp_for_log = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ["AUDITOR_RUN_TIMESTAMP"] = run_timestamp_for_log
 
@@ -1654,57 +2100,70 @@ if __name__ == "__main__":
     use_timestamp_dir = "--no_timestamp_run_dir" not in sys.argv
     out_dir_for_log = base_out_dir_for_log if not use_timestamp_dir else base_out_dir_for_log / f"run_{run_timestamp_for_log}"
 
+    # ----------------------------------------------------------------
+    # Cleanup: delete ALL previous logs, folders, and run directories
+    # before creating the new run folder. This ensures a clean slate.
+    # ----------------------------------------------------------------
     if has_cli_flag("--clean_out_dir"):
+        # Delete the entire base output folder (all previous runs).
         safe_remove_tree(base_out_dir_for_log, "base output folder")
     elif has_cli_flag("--clean_run_dir"):
+        # Delete only the current run folder (keeps sibling run folders).
         safe_remove_tree(out_dir_for_log, "current run folder")
+    else:
+        # Default: clean ALL previous run_* subdirectories inside the base folder.
+        # This deletes logs, CSVs, JSON, Word docs, and charts from previous runs
+        # so the researcher only sees the current run's outputs.
+        if base_out_dir_for_log.exists():
+            cleaned_any = False
+            for child in sorted(base_out_dir_for_log.iterdir()):
+                if child.is_dir() and child.name.startswith("run_"):
+                    safe_remove_tree(child, f"previous run folder {child.name}")
+                    cleaned_any = True
+                elif child.is_file() and child.suffix in {".txt", ".csv", ".json", ".md", ".docx", ".png"}:
+                    try:
+                        child.unlink()
+                        print(f"[CLEANUP] Removed previous file: {child}", flush=True)
+                        cleaned_any = True
+                    except Exception as exc:
+                        print(f"[CLEANUP WARN] Could not remove {child}: {exc}", flush=True)
+            if not cleaned_any:
+                print(f"[CLEANUP] No previous run folders or log files found in {base_out_dir_for_log}.", flush=True)
 
     out_dir_for_log.mkdir(parents=True, exist_ok=True)
-    base_out_dir_for_log.mkdir(parents=True, exist_ok=True)
 
-    console_log_path = out_dir_for_log / f"console_output_{run_timestamp_for_log}.txt"
-    latest_log_path = base_out_dir_for_log / "console_output_latest.txt"
-    started_marker_path = out_dir_for_log / f"RUN_STARTED_{run_timestamp_for_log}.txt"
-    started_marker_path.write_text(
-        f"Run started: {run_timestamp_for_log}\n"
-        f"Run folder: {out_dir_for_log.resolve()}\n"
-        f"Command: {' '.join(sys.argv)}\n",
-        encoding="utf-8",
-    )
+    single_log_path = out_dir_for_log / f"run_log_{run_timestamp_for_log}.txt"
 
     original_stdout = sys.stdout
     original_stderr = sys.stderr
 
-    # buffering=1 enables line-buffering so the file updates while the script runs.
-    log_file = console_log_path.open("w", encoding="utf-8", buffering=1)
-    latest_log_file = latest_log_path.open("w", encoding="utf-8", buffering=1)
-
-    sys.stdout = Tee(original_stdout, log_file, latest_log_file)
-    sys.stderr = Tee(original_stderr, log_file, latest_log_file)
+    # Line buffering keeps the log readable with: tail -f run_log_*.txt
+    log_file = single_log_path.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = Tee(original_stdout, log_file)
+    sys.stderr = Tee(original_stderr, log_file)
 
     try:
-        print(f"[LOG] Console output will be saved to: {console_log_path.resolve()}", flush=True)
-        print(f"[LOG] Latest console output will also be saved to: {latest_log_path.resolve()}", flush=True)
-        print(f"[LOG] Output directory resolved to: {out_dir_for_log.resolve()}", flush=True)
-        print(f"[LOG] Run started marker created at: {started_marker_path.resolve()}", flush=True)
+        print("\n" + "=" * 96, flush=True)
+        print(f"[LOG] New run started: {run_timestamp_for_log}", flush=True)
+        print(f"[LOG] Single run log: {single_log_path.resolve()}", flush=True)
+        print(f"[LOG] Output directory: {out_dir_for_log.resolve()}", flush=True)
+        print(f"[LOG] Command: {' '.join(sys.argv)}", flush=True)
+        print("[LOG] Full prompt-level detail is enabled by default in this version.", flush=True)
+        print("[LOG] Chain-of-thought trace is written for every evaluated prompt.", flush=True)
+        print("[LOG] The Word report will include every prompt/test record, all layer/awakening data, and the CoT trace unless --no_word_report is used.", flush=True)
         main()
 
     except Exception as exc:
-        # This ensures crashes are also written to the log file.
         print("\n[FATAL ERROR] The script stopped before completing.", flush=True)
         print(f"[FATAL ERROR] {type(exc).__name__}: {exc}", flush=True)
         traceback.print_exc()
         raise
 
     finally:
-        # Restore the real console streams before closing the logs.
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         log_file.flush()
-        latest_log_file.flush()
         log_file.close()
-        latest_log_file.close()
 
-    print(f"\nConsole output saved to: {console_log_path.resolve()}")
-    print(f"Latest console output saved to: {latest_log_path.resolve()}")
+    print(f"\nSingle run log saved to: {single_log_path.resolve()}")
     print(f"Run folder: {out_dir_for_log.resolve()}")
