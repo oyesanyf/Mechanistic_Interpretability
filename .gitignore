@@ -38,9 +38,12 @@ env/
 
 # Project specific
 african_safety_research_outputs/
+crosslingual_safety_circuit_outputs/
 .ipynb_checkpoints/
 *.csv
 *.json
+*.exe
+python/
 !README.md
 !DIAGRAMS.md
 

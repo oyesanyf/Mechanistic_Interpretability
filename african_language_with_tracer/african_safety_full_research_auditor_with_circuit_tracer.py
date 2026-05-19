@@ -42,6 +42,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import warnings
 import time
@@ -1747,6 +1748,284 @@ def get_out_dir_from_argv(default: str = "african_safety_research_outputs") -> P
             return Path(arg.split("=", 1)[1])
     return Path(default)
 
+# ---------------------------------------------------------------------------
+# Optional Circuit Tracer integration
+# ---------------------------------------------------------------------------
+def _repo_root_default() -> Path:
+    """Return the project root where helper repos should live.
+
+    This intentionally uses the current working directory, because the user runs
+    the auditor from the project root (for example: cross-lingual-safety-fragility).
+    Circuit Tracer is cloned into ./repository/circuit-tracer once and reused.
+    """
+    return Path.cwd()
+
+
+def ensure_circuit_tracer_repo(args) -> Path:
+    """Clone Circuit Tracer once into the project root and make it importable.
+
+    This does NOT reclone on every run. If repository/circuit-tracer already
+    exists, the function reuses it. Installation is also conservative: it only
+    attempts an editable install when the package cannot already be imported.
+    """
+    root = Path(args.circuit_tracer_root).expanduser()
+    if not root.is_absolute():
+        root = (_repo_root_default() / root).resolve()
+    repo_parent = root / "repository"
+    repo_dir = repo_parent / "circuit-tracer"
+
+    if not repo_dir.exists():
+        if not args.circuit_tracer_auto_install:
+            raise RuntimeError(
+                f"Circuit Tracer repo not found at {repo_dir}. Re-run with --circuit_tracer_auto_install "
+                "or clone it manually into the project root: repository/circuit-tracer"
+            )
+        repo_parent.mkdir(parents=True, exist_ok=True)
+        print(f"[CircuitTracer] Cloning once into: {repo_dir}", flush=True)
+        subprocess.run(
+            ["git", "clone", args.circuit_tracer_repo_url, str(repo_dir)],
+            check=True,
+        )
+    else:
+        print(f"[CircuitTracer] Reusing existing repo: {repo_dir}", flush=True)
+
+    # Add both the repo and demos folder, matching the notebook pattern.
+    for extra in [repo_dir, repo_dir / "demos"]:
+        extra_str = str(extra)
+        if extra_str not in sys.path:
+            sys.path.append(extra_str)
+
+    try:
+        import circuit_tracer  # noqa: F401
+        return repo_dir
+    except Exception as import_exc:
+        if not args.circuit_tracer_auto_install:
+            raise RuntimeError(
+                "Circuit Tracer is present but not importable. Re-run with --circuit_tracer_auto_install "
+                f"or install it manually with: pip install -e {repo_dir}"
+            ) from import_exc
+
+        print("[CircuitTracer] Package not importable yet; installing editable package once...", flush=True)
+        uv_path = shutil.which("uv")
+        if uv_path:
+            install_cmd = [uv_path, "pip", "install", "-e", str(repo_dir)]
+        else:
+            install_cmd = [sys.executable, "-m", "pip", "install", "-e", str(repo_dir)]
+        subprocess.run(install_cmd, check=True)
+
+        import circuit_tracer  # noqa: F401
+        return repo_dir
+
+
+def load_circuit_tracer_replacement_model(args):
+    """Optional smoke-test loader using the notebook-style API.
+
+    This proves the integration can load ReplacementModel without touching the
+    main Hugging Face model object used by the auditor.
+    """
+    import torch as _torch
+    from circuit_tracer import ReplacementModel
+
+    dtype_map = {
+        "float32": _torch.float32,
+        "fp32": _torch.float32,
+        "float16": _torch.float16,
+        "fp16": _torch.float16,
+        "bfloat16": _torch.bfloat16,
+        "bf16": _torch.bfloat16,
+    }
+    ct_dtype = dtype_map.get(str(args.circuit_tracer_dtype).lower(), _torch.bfloat16)
+    print(
+        f"[CircuitTracer] Loading ReplacementModel: model={args.circuit_tracer_model}, "
+        f"transcoders={args.circuit_tracer_transcoder_set}, dtype={ct_dtype}, backend={args.circuit_tracer_backend}",
+        flush=True,
+    )
+    return ReplacementModel.from_pretrained(
+        args.circuit_tracer_model,
+        args.circuit_tracer_transcoder_set,
+        dtype=ct_dtype,
+        backend=args.circuit_tracer_backend,
+    )
+
+
+def select_results_for_circuit_tracer(results: list[CombinedPromptResult], max_graphs: int, strategy: str) -> list[CombinedPromptResult]:
+    """Choose a small, high-value subset so Circuit Tracer does not explode runtime."""
+    unsafe = [r for r in results if r.prompt_kind == "unsafe"]
+    if not unsafe or max_graphs <= 0:
+        return []
+
+    if strategy == "lowest_clean_refusal":
+        ranked = sorted(unsafe, key=lambda r: (r.mean_clean_refusal_prob, -abs(r.peak_rpd)))
+    elif strategy == "highest_awakening_gain":
+        ranked = sorted(
+            unsafe,
+            key=lambda r: (r.best_awakening.safety_awakening_gain if r.best_awakening else -999.0),
+            reverse=True,
+        )
+    elif strategy == "english_vs_low_resource_pairs":
+        # Prefer first English strong case plus low-resource weak cases for the same categories when available.
+        english = [r for r in unsafe if r.language.lower() == "english"]
+        low_resource = [r for r in unsafe if r.language.lower() != "english"]
+        low_ranked = sorted(low_resource, key=lambda r: r.mean_clean_refusal_prob)
+        chosen = []
+        if english:
+            chosen.append(max(english, key=lambda r: r.mean_clean_refusal_prob))
+        chosen.extend(low_ranked)
+        ranked = chosen
+    else:
+        # balanced default: prioritize low clean refusal, then large awakening gain.
+        ranked = sorted(
+            unsafe,
+            key=lambda r: (
+                r.mean_clean_refusal_prob,
+                -(r.best_awakening.safety_awakening_gain if r.best_awakening else 0.0),
+            ),
+        )
+
+    selected = []
+    seen = set()
+    for item in ranked:
+        key = (item.language, item.scaffold, item.seed, item.prompt_kind, item.category)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(item)
+        if len(selected) >= max_graphs:
+            break
+    return selected
+
+
+def _safe_slug(text: str, max_len: int = 90) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-")
+    return text[:max_len] or "circuit-trace"
+
+
+def run_circuit_tracer_cli_for_results(args, selected: list[CombinedPromptResult], out_dir: Path) -> Optional[Path]:
+    """Run Circuit Tracer CLI on selected prompts and save graph artifacts.
+
+    This is intentionally optional and separated from the main experiment. If it
+    fails, the main research CSV/JSON/Word report still exists.
+    """
+    if not selected:
+        print("[CircuitTracer] No prompt records selected for tracing.", flush=True)
+        return None
+
+    repo_dir = ensure_circuit_tracer_repo(args)
+    if args.circuit_tracer_smoke_load:
+        replacement_model = load_circuit_tracer_replacement_model(args)
+        del replacement_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    graph_root = out_dir / "circuit_tracer_graphs"
+    graph_root.mkdir(parents=True, exist_ok=True)
+    graph_json_dir = graph_root / "graph_files"
+    graph_json_dir.mkdir(parents=True, exist_ok=True)
+
+    exe = shutil.which("circuit-tracer")
+    if exe:
+        base_cmd = [exe, "attribute"]
+    else:
+        # Fallback for environments where the console script is not on PATH.
+        base_cmd = [sys.executable, "-m", "circuit_tracer", "attribute"]
+
+    rows = []
+    for i, item in enumerate(selected, start=1):
+        slug = _safe_slug(
+            f"{i:02d}-{item.language}-{item.scaffold}-{item.category}-seed{item.seed}"
+        )
+        graph_pt = graph_root / f"{slug}.pt"
+        prompt_txt = graph_root / f"{slug}.prompt.txt"
+        prompt_txt.write_text(item.prompt_text, encoding="utf-8")
+
+        cmd = [
+            *base_cmd,
+            "--prompt", item.prompt_text,
+            "--transcoder_set", args.circuit_tracer_transcoder_set,
+            "--model", args.circuit_tracer_model,
+            "--slug", slug,
+            "--graph_file_dir", str(graph_json_dir),
+            "--graph_output_path", str(graph_pt),
+            "--dtype", args.circuit_tracer_dtype,
+            "--max_n_logits", str(args.circuit_tracer_max_n_logits),
+            "--desired_logit_prob", str(args.circuit_tracer_desired_logit_prob),
+            "--batch_size", str(args.circuit_tracer_batch_size),
+            "--node_threshold", str(args.circuit_tracer_node_threshold),
+            "--edge_threshold", str(args.circuit_tracer_edge_threshold),
+        ]
+        if args.circuit_tracer_max_feature_nodes > 0:
+            cmd.extend(["--max_feature_nodes", str(args.circuit_tracer_max_feature_nodes)])
+        if args.circuit_tracer_offload.lower() != "none":
+            cmd.extend(["--offload", args.circuit_tracer_offload])
+        if args.circuit_tracer_verbose:
+            cmd.append("--verbose")
+        if args.circuit_tracer_server:
+            cmd.append("--server")
+
+        log_path = graph_root / f"{slug}.circuit_tracer.log.txt"
+        print(f"[CircuitTracer] [{i}/{len(selected)}] Tracing {item.language} / {item.category} -> {slug}", flush=True)
+        started = datetime.now().isoformat(timespec="seconds")
+        status = "not_run"
+        error = ""
+        with log_path.open("w", encoding="utf-8", buffering=1) as log_f:
+            log_f.write("Command:\n" + " ".join(cmd) + "\n\n")
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    cwd=str(repo_dir.parent),
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=args.circuit_tracer_timeout_seconds if args.circuit_tracer_timeout_seconds > 0 else None,
+                    check=False,
+                )
+                status = "ok" if completed.returncode == 0 else f"failed_returncode_{completed.returncode}"
+            except subprocess.TimeoutExpired as exc:
+                status = "timeout"
+                error = str(exc)
+            except Exception as exc:
+                status = "error"
+                error = f"{type(exc).__name__}: {exc}"
+
+        rows.append({
+            "slug": slug,
+            "status": status,
+            "error": error,
+            "started": started,
+            "language": item.language,
+            "scaffold": item.scaffold,
+            "seed": item.seed,
+            "prompt_kind": item.prompt_kind,
+            "category": item.category,
+            "mean_clean_refusal_prob": item.mean_clean_refusal_prob,
+            "peak_rpd": item.peak_rpd,
+            "peak_rpd_layer": item.peak_rpd_layer,
+            "best_awakening_layer": item.best_awakening.target_layer if item.best_awakening else "",
+            "best_awakening_gain": item.best_awakening.safety_awakening_gain if item.best_awakening else "",
+            "prompt_file": str(prompt_txt.resolve()),
+            "graph_output_path": str(graph_pt.resolve()),
+            "graph_file_dir": str(graph_json_dir.resolve()),
+            "log_path": str(log_path.resolve()),
+        })
+        print(f"[CircuitTracer] Result: {status}; log={log_path}", flush=True)
+
+    manifest = graph_root / "circuit_tracer_manifest.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = list(rows[0].keys()) if rows else []
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    (graph_root / "README_CIRCUIT_TRACER.txt").write_text(
+        "Circuit Tracer artifacts for selected prompts.\n"
+        "These are optional post-run mechanistic-interpretability traces and do not replace the auditor CSV/JSON.\n"
+        "Open circuit_tracer_manifest.csv to see which prompts were traced and where each graph/log was written.\n",
+        encoding="utf-8",
+    )
+    print(f"[CircuitTracer] Saved manifest: {manifest.resolve()}", flush=True)
+    return manifest
+
+
 
 # ---------------------------------------------------------------------------
 # CLI and main
@@ -1786,6 +2065,29 @@ def parse_args():
     parser.add_argument("--compact_console", action="store_true", default=False, help="Print compact progress to avoid screen lock/freezing")
     parser.add_argument("--full_console", dest="compact_console", action="store_false", help="Print detailed progress")
     parser.add_argument("--heartbeat_seconds", type=float, default=10.0, help="Minimum seconds between progress heartbeat messages")
+
+    # Optional Circuit Tracer post-run integration. This does not change the main auditor.
+    parser.add_argument("--enable_circuit_tracer", action="store_true", help="After the auditor run, trace selected prompts with decoderesearch/circuit-tracer")
+    parser.add_argument("--circuit_tracer_auto_install", action="store_true", help="Clone/install Circuit Tracer once into ./repository/circuit-tracer if missing")
+    parser.add_argument("--circuit_tracer_repo_url", default="https://github.com/decoderesearch/circuit-tracer", help="Circuit Tracer git repository URL")
+    parser.add_argument("--circuit_tracer_root", default=".", help="Project root where repository/circuit-tracer should live; default is current working directory")
+    parser.add_argument("--circuit_tracer_model", default="google/gemma-2-2b", help="Model to use inside Circuit Tracer. For Gemma IT experiments try google/gemma-2-2b-it if supported.")
+    parser.add_argument("--circuit_tracer_transcoder_set", default="gemma", help="Transcoder set for Circuit Tracer, e.g. gemma or a Hugging Face transcoder repo/path")
+    parser.add_argument("--circuit_tracer_backend", default="transformerlens", choices=["transformerlens", "nnsight"], help="Backend for optional ReplacementModel smoke load")
+    parser.add_argument("--circuit_tracer_dtype", default="bfloat16", help="Circuit Tracer dtype: bfloat16/bf16, float16/fp16, or float32/fp32")
+    parser.add_argument("--circuit_tracer_smoke_load", action="store_true", help="Before CLI tracing, load ReplacementModel once using the notebook-style API")
+    parser.add_argument("--circuit_tracer_max_graphs", type=int, default=4, help="Maximum selected prompt records to trace")
+    parser.add_argument("--circuit_tracer_select", default="balanced", choices=["balanced", "lowest_clean_refusal", "highest_awakening_gain", "english_vs_low_resource_pairs"], help="How to select prompt records for Circuit Tracer")
+    parser.add_argument("--circuit_tracer_max_n_logits", type=int, default=10, help="Circuit Tracer max_n_logits")
+    parser.add_argument("--circuit_tracer_desired_logit_prob", type=float, default=0.95, help="Circuit Tracer desired_logit_prob")
+    parser.add_argument("--circuit_tracer_batch_size", type=int, default=64, help="Circuit Tracer batch size; lower this on low VRAM")
+    parser.add_argument("--circuit_tracer_max_feature_nodes", type=int, default=2500, help="Circuit Tracer max feature nodes; use 0 to omit")
+    parser.add_argument("--circuit_tracer_node_threshold", type=float, default=0.8, help="Circuit Tracer graph node threshold")
+    parser.add_argument("--circuit_tracer_edge_threshold", type=float, default=0.98, help="Circuit Tracer graph edge threshold")
+    parser.add_argument("--circuit_tracer_offload", default="none", choices=["none", "cpu", "disk"], help="Circuit Tracer offload mode")
+    parser.add_argument("--circuit_tracer_timeout_seconds", type=int, default=0, help="Per-graph timeout in seconds; 0 means no timeout")
+    parser.add_argument("--circuit_tracer_verbose", action="store_true", help="Pass --verbose to Circuit Tracer")
+    parser.add_argument("--circuit_tracer_server", action="store_true", help="Start Circuit Tracer visualization server after tracing; usually leave OFF for batch runs")
     return parser.parse_args()
 
 
@@ -1831,6 +2133,11 @@ def main() -> None:
     print(f"Clean output folder    : {'ON' if args.clean_out_dir else 'OFF'}")
     print(f"Clean run folder       : {'ON' if args.clean_run_dir else 'OFF'}")
     print(f"Word report            : {'OFF' if args.no_word_report else 'ON'}")
+    print(f"Circuit Tracer         : {'ON' if args.enable_circuit_tracer else 'OFF'}")
+    if args.enable_circuit_tracer:
+        print(f"Circuit Tracer root    : {Path(args.circuit_tracer_root).expanduser()}")
+        print(f"Circuit Tracer model   : {args.circuit_tracer_model}")
+        print(f"Circuit Tracer traces  : max {args.circuit_tracer_max_graphs} selected by {args.circuit_tracer_select}")
 
     print("\n[1] Loading tokenizer and model...")
     with Spinner("Loading"):
@@ -2122,6 +2429,28 @@ def main() -> None:
     print("\n[Saving] Writing CSV, JSON, Markdown report, audit trace log, and charts with threaded artifact writers...")
     run_log_path_for_save = out_dir / f"run_log_{run_timestamp}.txt"
     save_artifacts_threaded(all_results, summaries, out_dir, run_metadata, save_docx_report=not args.no_word_report, run_log_path=run_log_path_for_save)
+
+    if args.enable_circuit_tracer:
+        print("\n[CircuitTracer] Optional post-run tracing is enabled.", flush=True)
+        selected_for_ct = select_results_for_circuit_tracer(
+            all_results,
+            max_graphs=args.circuit_tracer_max_graphs,
+            strategy=args.circuit_tracer_select,
+        )
+        for idx, item in enumerate(selected_for_ct, start=1):
+            print(
+                f"[CircuitTracer] Selected {idx}: {item.language} / {item.scaffold} / {item.category} / "
+                f"CleanRef={item.mean_clean_refusal_prob:.6f} / PeakRPD={item.peak_rpd:.6f}",
+                flush=True,
+            )
+        try:
+            ct_manifest = run_circuit_tracer_cli_for_results(args, selected_for_ct, out_dir)
+            if ct_manifest is not None:
+                print(f"[CircuitTracer] Completed optional traces. Manifest: {ct_manifest.resolve()}", flush=True)
+        except Exception as exc:
+            print("[CircuitTracer WARN] Optional Circuit Tracer step failed, but the main auditor completed.", flush=True)
+            print(f"[CircuitTracer WARN] {type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
 
     print("\nINTERPRETATION NOTES")
     print("- English/control vs African-language conditions helps separate cross-lingual effects from model-wide behavior.")
