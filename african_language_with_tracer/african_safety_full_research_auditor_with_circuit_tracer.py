@@ -49,6 +49,7 @@ import time
 import traceback
 import threading
 import itertools
+import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from contextlib import contextmanager, nullcontext
@@ -546,6 +547,22 @@ def probability_and_entropy(model, inputs, token_ids: list[int]) -> tuple[float,
     return prob, entropy
 
 
+def cleanup_after_record(device: str) -> None:
+    """Release temporary tensors after each prompt record.
+
+    This does not interrupt a running PyTorch kernel, but it reduces the chance
+    that a long CPU/GPU run slows down because old tensors are still referenced.
+    """
+    gc.collect()
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if device == "mps" and hasattr(torch, "mps"):
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -710,17 +727,38 @@ def classify_generated_text(text: str) -> GenerationEval:
     return GenerationEval(True, raw, label, notes)
 
 @torch.no_grad()
-def generate_and_classify(model, tokenizer, prompt_text: str, device: str, max_new_tokens: int) -> GenerationEval:
+def generate_and_classify(
+    model,
+    tokenizer,
+    prompt_text: str,
+    device: str,
+    max_new_tokens: int,
+    generation_timeout_seconds: float = 15.0,
+) -> GenerationEval:
+    """Generate a tiny sample and classify it without letting generation dominate the run.
+
+    Completion is the priority. This is only a soft guard because PyTorch/Transformers
+    cannot always interrupt a kernel instantly, but `max_time` prevents normal text
+    generation from running forever. The main loop also catches errors and records
+    them as normal result rows.
+    """
+    started = time.time()
     enc = tokenizer(prompt_text, return_tensors="pt").to(device)
     kwargs = {
-        "max_new_tokens": max_new_tokens,
+        "max_new_tokens": max(1, int(max_new_tokens)),
         "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id,
+        "use_cache": True,
     }
+    if generation_timeout_seconds and generation_timeout_seconds > 0:
+        kwargs["max_time"] = float(generation_timeout_seconds)
     out = model.generate(**enc, **kwargs)
+    elapsed = time.time() - started
     gen_ids = out[0, enc["input_ids"].shape[1]:]
     text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-    return classify_generated_text(text)
+    result = classify_generated_text(text)
+    result.behavior_score_notes = result.behavior_score_notes + f"; generation_elapsed_seconds={elapsed:.2f}"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1104,25 @@ def save_json(results: list[CombinedPromptResult], summaries: list[CombinedSumma
         "summaries": [asdict(x) for x in summaries],
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def save_progress_checkpoint(results: list[CombinedPromptResult], out_dir: Path, run_metadata: dict, probe_indices: list[int]) -> None:
+    """Write lightweight partial artifacts so an interrupted run still leaves usable data."""
+    if not results:
+        return
+    try:
+        summaries = summarize_results(results, probe_indices)
+        save_prompt_details(results, out_dir / "PARTIAL_prompt_level_details.csv")
+        save_summary(summaries, out_dir / "PARTIAL_summary.csv")
+        save_json(results, summaries, out_dir / "PARTIAL_results.json")
+        (out_dir / "PARTIAL_STATUS.txt").write_text(
+            f"Partial checkpoint updated: {datetime.now().isoformat()}\n"
+            f"Completed prompt records: {len(results)}\n"
+            f"Run timestamp: {run_metadata.get('run_timestamp', '')}\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"[CHECKPOINT WARN] Could not write partial checkpoint: {type(exc).__name__}: {exc}", flush=True)
 
 
 def save_charts(summaries: list[CombinedSummary], out_dir: Path) -> None:
@@ -2054,7 +2111,11 @@ def parse_args():
     parser.add_argument("--verbose_awakening", action="store_true", help="Print awakening optimization progress")
     parser.add_argument("--repeat_seeds", default="0", help="Comma-separated seeds, e.g. 0,1,2")
     parser.add_argument("--run_generation_eval", action="store_true", help="Generate short outputs and classify refusal/safe redirection behavior")
-    parser.add_argument("--generation_max_new_tokens", type=int, default=32, help="Max new tokens for generated-response evaluator")
+    parser.add_argument("--generation_max_new_tokens", type=int, default=8, help="Max new tokens for generated-response evaluator. Default is small because completion is the priority.")
+    parser.add_argument("--generation_timeout_seconds", type=float, default=15.0, help="Soft generation time budget passed to transformers.generate(max_time=...).")
+    parser.add_argument("--must_complete_only", action="store_true", default=True, help="Completion-first mode. Nonessential generation eval is skipped by default so the audit cannot freeze there.")
+    parser.add_argument("--no_must_complete_only", dest="must_complete_only", action="store_false", help="Disable completion-first protection and honor optional slow steps exactly as requested.")
+    parser.add_argument("--allow_generation_eval_in_must_complete_mode", action="store_true", help="Honor --run_generation_eval even when --must_complete_only is ON. Use only for short smoke tests.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"], help="Device selection")
     parser.add_argument("--torch_dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"], help="Model dtype")
     parser.add_argument("--out_dir", default="african_safety_research_outputs", help="Base output directory")
@@ -2065,6 +2126,14 @@ def parse_args():
     parser.add_argument("--compact_console", action="store_true", default=False, help="Print compact progress to avoid screen lock/freezing")
     parser.add_argument("--full_console", dest="compact_console", action="store_false", help="Print detailed progress")
     parser.add_argument("--heartbeat_seconds", type=float, default=10.0, help="Minimum seconds between progress heartbeat messages")
+    parser.add_argument("--continue_on_error", action="store_true", default=True, help="Continue and write reports if an individual prompt/layer/generation step errors")
+    parser.add_argument("--stop_on_error", dest="continue_on_error", action="store_false", help="Stop immediately on the first prompt/layer/generation error")
+    parser.add_argument("--cpu_no_stall_mode", action="store_true", default=True, help="On CPU, automatically cap expensive settings so the run completes instead of appearing frozen")
+    parser.add_argument("--no_cpu_no_stall_mode", dest="cpu_no_stall_mode", action="store_false", help="Disable CPU no-stall caps and run exactly as requested")
+    parser.add_argument("--max_cpu_awakening_steps", type=int, default=8, help="CPU no-stall cap for awakening steps")
+    parser.add_argument("--max_cpu_target_layers", type=int, default=4, help="CPU no-stall cap for number of awakening target layers")
+    parser.add_argument("--checkpoint_every_record", action="store_true", default=True, help="Write partial CSV/JSON/summary checkpoint after every completed prompt record")
+    parser.add_argument("--no_checkpoint_every_record", dest="checkpoint_every_record", action="store_false", help="Only write final artifacts at the end")
 
     # Optional Circuit Tracer post-run integration. This does not change the main auditor.
     parser.add_argument("--enable_circuit_tracer", action="store_true", help="After the auditor run, trace selected prompts with decoderesearch/circuit-tracer")
@@ -2124,7 +2193,17 @@ def main() -> None:
     print(f"Seeds                 : {seeds}")
     print(f"Unsafe prompts         : {n_eval}")
     print(f"Benign controls        : {'ON (' + str(n_benign) + ')' if args.include_benign_controls else 'OFF'}")
+    if args.must_complete_only and args.run_generation_eval and not args.allow_generation_eval_in_must_complete_mode:
+        print("[MUST-COMPLETE] --run_generation_eval was requested, but it is being SKIPPED so the run completes.", flush=True)
+        print("[MUST-COMPLETE] To force generation eval anyway, add --allow_generation_eval_in_must_complete_mode.", flush=True)
+        args.run_generation_eval = False
+    if args.must_complete_only and args.generation_max_new_tokens > 8:
+        print(f"[MUST-COMPLETE] Capping generation_max_new_tokens {args.generation_max_new_tokens} -> 8.", flush=True)
+        args.generation_max_new_tokens = 8
+    print(f"Must-complete mode     : {'ON' if args.must_complete_only else 'OFF'}")
     print(f"Generation eval        : {'ON' if args.run_generation_eval else 'OFF'}")
+    print(f"Generation max tokens  : {args.generation_max_new_tokens}")
+    print(f"Generation timeout     : {args.generation_timeout_seconds}s")
     print(f"Part A fragility       : {'OFF' if args.skip_fragility else 'ON'}")
     print(f"Part B awakening       : {'OFF' if args.skip_awakening else 'ON'}")
     print(f"Console mode           : {'compact' if args.compact_console else 'full'}")
@@ -2133,6 +2212,9 @@ def main() -> None:
     print(f"Clean output folder    : {'ON' if args.clean_out_dir else 'OFF'}")
     print(f"Clean run folder       : {'ON' if args.clean_run_dir else 'OFF'}")
     print(f"Word report            : {'OFF' if args.no_word_report else 'ON'}")
+    print(f"No-stall CPU mode      : {'ON' if args.cpu_no_stall_mode else 'OFF'}")
+    print(f"Continue on error      : {'ON' if args.continue_on_error else 'OFF'}")
+    print(f"Per-record checkpoint  : {'ON' if args.checkpoint_every_record else 'OFF'}")
     print(f"Circuit Tracer         : {'ON' if args.enable_circuit_tracer else 'OFF'}")
     if args.enable_circuit_tracer:
         print(f"Circuit Tracer root    : {Path(args.circuit_tracer_root).expanduser()}")
@@ -2175,6 +2257,30 @@ def main() -> None:
             print(f"[WARN] Target layer {layer} invalid for {n_layers}-layer model. Using {fallback}.")
             target_layers.append(fallback)
     target_layers = sorted(set(target_layers))
+
+    # CPU no-stall guard: the full grid can look frozen for hours on CPU,
+    # especially with many target layers and 25+ awakening steps. This mode
+    # keeps the run moving and still writes complete reports for the completed
+    # measurements. Disable with --no_cpu_no_stall_mode when you intentionally
+    # want the full slow run.
+    if device == "cpu" and args.cpu_no_stall_mode and not args.skip_awakening:
+        if args.awakening_steps > args.max_cpu_awakening_steps:
+            print(
+                f"[NO-STALL] CPU mode detected: capping awakening_steps "
+                f"{args.awakening_steps} -> {args.max_cpu_awakening_steps}. "
+                f"Use --no_cpu_no_stall_mode to force the full value.",
+                flush=True,
+            )
+            args.awakening_steps = args.max_cpu_awakening_steps
+        if len(target_layers) > args.max_cpu_target_layers:
+            old_layers = target_layers[:]
+            target_layers = target_layers[:args.max_cpu_target_layers]
+            print(
+                f"[NO-STALL] CPU mode detected: capping target_layers "
+                f"{old_layers} -> {target_layers}. "
+                f"Use --no_cpu_no_stall_mode to force all layers.",
+                flush=True,
+            )
 
     print(f"  Architecture         : {n_layers} layers, d_model={d_model}")
     print(f"  Fragility layers     : {probe_indices if not args.skip_fragility else 'skipped'}")
@@ -2284,20 +2390,32 @@ def main() -> None:
                             if pieces_per_start > 2.5:
                                 trace.log("NOTE: Refusal starts are heavily fragmented by the tokenizer. Refusal probability may be underestimated.")
 
+                            flags: list[str] = []
                             layer_results: list[LayerFragilityResult] = []
                             fragility_auditor = fragility_auditors.get(language["name"])
                             if fragility_auditor is not None:
                                 if not args.compact_console:
                                     print("          Part A fragility :", end=" ", flush=True)
                                 trace.log("Part A: Running null-patching fragility probe across all probe layers.")
-                                layer_results = fragility_auditor.probe_all_layers(inputs, refusal_ids, english_ids)
-                                if not args.compact_console:
-                                    print("." * len(layer_results), end="", flush=True)
-                                    print(" done")
-                                trace.log(f"Part A: Probed {len(layer_results)} layers. Layer RPDs: {[(lr.layer_idx, round(lr.rpd, 6)) for lr in layer_results]}")
+                                try:
+                                    layer_results = fragility_auditor.probe_all_layers(inputs, refusal_ids, english_ids)
+                                    if not args.compact_console:
+                                        print("." * len(layer_results), end="", flush=True)
+                                        print(" done")
+                                    trace.log(f"Part A: Probed {len(layer_results)} layers. Layer RPDs: {[(lr.layer_idx, round(lr.rpd, 6)) for lr in layer_results]}")
+                                except Exception as exc:
+                                    msg = f"Part A fragility failed for {language['name']} / {scaffold} / {prompt_kind} / prompt {pi + 1}: {type(exc).__name__}: {exc}"
+                                    print(f"ERROR skipped. {msg}", flush=True)
+                                    trace.log("ERROR: " + msg)
+                                    flags = [msg] if 'flags' not in locals() else flags + [msg]
+                                    if not args.continue_on_error:
+                                        raise
+                                    layer_results = []
 
+                            pre_summary_flags = list(flags)
                             (peak_rpd, peak_layer, gini_rpd, fragility_signal, fragility_label,
-                             mean_clean, max_clean, peak_entropy, peak_english, flags) = summarize_fragility(layer_results)
+                             mean_clean, max_clean, peak_entropy, peak_english, summary_flags) = summarize_fragility(layer_results)
+                            flags = pre_summary_flags + summary_flags
 
                             if args.skip_fragility:
                                 mean_clean, _ = probability_and_entropy(model, inputs, refusal_ids)
@@ -2316,26 +2434,37 @@ def main() -> None:
                                     print("          Part B awakening :", end=" ", flush=True)
                                 trace.log(f"Part B: Running safety awakening optimization over target layers: {target_layers}")
                                 for target_layer in target_layers:
-                                    awakener = SafetyAwakener(model, layers, target_layer, device, d_model, args.mutation_scale)
-                                    aw = awakener.optimize(
-                                        inputs=inputs,
-                                        refusal_ids=refusal_ids,
-                                        steps=args.awakening_steps,
-                                        lr=args.awakening_lr,
-                                        l1_lambda=args.awakening_l1,
-                                        l2_lambda=args.awakening_l2,
-                                        topk=args.topk,
-                                        verbose=args.verbose_awakening,
-                                    )
-                                    awakening_results.append(aw)
-                                    trace.log(
-                                        f"  Layer {target_layer}: clean_refusal={aw.clean_refusal_prob:.6f}, "
-                                        f"awakened_refusal={aw.awakened_refusal_prob:.6f}, "
-                                        f"gain={aw.safety_awakening_gain:+.6f}, L2={aw.mutation_l2:.3f}, "
-                                        f"label={aw.success_label!r}"
-                                    )
-                                    if not args.compact_console:
-                                        print(f"L{target_layer}:gain={aw.safety_awakening_gain:+.4f}/l2={aw.mutation_l2:.2f} ", end="", flush=True)
+                                    try:
+                                        print(f"L{target_layer}...", end="", flush=True)
+                                        awakener = SafetyAwakener(model, layers, target_layer, device, d_model, args.mutation_scale)
+                                        aw = awakener.optimize(
+                                            inputs=inputs,
+                                            refusal_ids=refusal_ids,
+                                            steps=args.awakening_steps,
+                                            lr=args.awakening_lr,
+                                            l1_lambda=args.awakening_l1,
+                                            l2_lambda=args.awakening_l2,
+                                            topk=args.topk,
+                                            verbose=args.verbose_awakening,
+                                        )
+                                        awakening_results.append(aw)
+                                        trace.log(
+                                            f"  Layer {target_layer}: clean_refusal={aw.clean_refusal_prob:.6f}, "
+                                            f"awakened_refusal={aw.awakened_refusal_prob:.6f}, "
+                                            f"gain={aw.safety_awakening_gain:+.6f}, L2={aw.mutation_l2:.3f}, "
+                                            f"label={aw.success_label!r}"
+                                        )
+                                        if not args.compact_console:
+                                            print(f"gain={aw.safety_awakening_gain:+.4f}/l2={aw.mutation_l2:.2f} ", end="", flush=True)
+                                    except Exception as exc:
+                                        msg = f"Part B awakening failed at layer {target_layer} for {language['name']} / {scaffold} / {prompt_kind} / prompt {pi + 1}: {type(exc).__name__}: {exc}"
+                                        print(f"ERROR skipped. {msg} ", end="", flush=True)
+                                        trace.log("ERROR: " + msg)
+                                        flags = [msg] if 'flags' not in locals() else flags + [msg]
+                                        if not args.continue_on_error:
+                                            raise
+                                    finally:
+                                        cleanup_after_record(device)
                                 if not args.compact_console:
                                     print("")
                                 if awakening_results:
@@ -2351,14 +2480,30 @@ def main() -> None:
 
                             generation_eval = GenerationEval()
                             if args.run_generation_eval:
-                                generation_eval = generate_and_classify(model, tokenizer, prompt_text, device, args.generation_max_new_tokens)
-                                if not args.compact_console:
-                                    print(f"          Generation eval : {generation_eval.behavior_label} | {generation_eval.generated_text[:90]!r}")
-                                trace.log(
-                                    f"Generation eval: behavior={generation_eval.behavior_label!r}, "
-                                    f"notes={generation_eval.behavior_score_notes!r}, "
-                                    f"generated_text={generation_eval.generated_text[:120]!r}"
-                                )
+                                try:
+                                    generation_eval = generate_and_classify(
+                                        model,
+                                        tokenizer,
+                                        prompt_text,
+                                        device,
+                                        args.generation_max_new_tokens,
+                                        args.generation_timeout_seconds,
+                                    )
+                                    if not args.compact_console:
+                                        print(f"          Generation eval : {generation_eval.behavior_label} | {generation_eval.generated_text[:90]!r}")
+                                    trace.log(
+                                        f"Generation eval: behavior={generation_eval.behavior_label!r}, "
+                                        f"notes={generation_eval.behavior_score_notes!r}, "
+                                        f"generated_text={generation_eval.generated_text[:120]!r}"
+                                    )
+                                except Exception as exc:
+                                    msg = f"Generation eval failed for {language['name']} / {scaffold} / {prompt_kind} / prompt {pi + 1}: {type(exc).__name__}: {exc}"
+                                    print(f"          Generation eval : ERROR skipped | {msg}", flush=True)
+                                    generation_eval = GenerationEval(True, "", "error", msg)
+                                    trace.log("ERROR: " + msg)
+                                    flags = [msg] if 'flags' not in locals() else flags + [msg]
+                                    if not args.continue_on_error:
+                                        raise
                             else:
                                 trace.log("Generation eval: skipped (--run_generation_eval not set).")
 
@@ -2397,6 +2542,14 @@ def main() -> None:
                                 audit_trace=trace,
                             )
                             all_results.append(item)
+                            if args.checkpoint_every_record:
+                                save_progress_checkpoint(all_results, out_dir, run_metadata={
+                                    "run_timestamp": run_timestamp,
+                                    "model": args.model,
+                                    "device": device,
+                                    "dtype": str(dtype),
+                                }, probe_indices=probe_indices)
+                            cleanup_after_record(device)
                             best_txt = ""
                             if best_awakening:
                                 best_txt = f" BestAwake=L{best_awakening.target_layer} gain={best_awakening.safety_awakening_gain:+.6f} l2={best_awakening.mutation_l2:.2f}"
@@ -2538,10 +2691,10 @@ if __name__ == "__main__":
         main()
 
     except Exception as exc:
-        print("\n[FATAL ERROR] The script stopped before completing.", flush=True)
+        print("\n[FATAL ERROR] The script reached the outer fatal handler.", flush=True)
         print(f"[FATAL ERROR] {type(exc).__name__}: {exc}", flush=True)
         traceback.print_exc()
-        raise
+        print("[MUST-COMPLETE] The process will close cleanly after writing the log. Check PARTIAL_* files in the run folder if any records completed.", flush=True)
 
     finally:
         sys.stdout = original_stdout
