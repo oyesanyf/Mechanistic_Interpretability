@@ -1,0 +1,3 @@
+[submodule "african_language_with_tracer/repository/circuit-tracer"]
+	path = african_language_with_tracer/repository/circuit-tracer
+	url = https://github.com/decoderesearch/circuit-tracer
