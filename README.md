@@ -299,6 +299,45 @@ python cross-lingual-safety-fragility/african_safety_full_research_auditor_threa
   --run_generation_eval
 ```
 
+### Quick Start — Extended Circuit-Tracer Auditor
+
+The extended auditor (`african_language_with_tracer/african_safety_full_research_auditor_with_circuit_tracer.py`) integrates the `circuit-tracer` toolkit to perform dynamic hook-based activation mapping and generate sub-graphs of safety pathways.
+
+To replicate the large-scale evaluation across 5 languages, 5 scaffolds, and multiple seeds with active circuit tracing:
+
+```bash
+python african_language_with_tracer/african_safety_full_research_auditor_with_circuit_tracer.py \
+  --languages English,Yoruba,Igbo,Hausa,Swahili \
+  --include_benign_controls \
+  --max_eval_prompts 10 \
+  --max_benign_prompts 5 \
+  --prompt_scaffolds baseline,safety_rubric,multi_option,chain_safety,tree_safety \
+  --target_layers 12,16,20,24,25 \
+  --repeat_seeds 0,1,2 \
+  --n_calibration 10 \
+  --awakening_steps 25 \
+  --device auto \
+  --torch_dtype auto \
+  --enable_circuit_tracer \
+  --circuit_tracer_auto_install \
+  --circuit_tracer_max_graphs 15 \
+  --circuit_tracer_select balanced \
+  --circuit_tracer_batch_size 16 \
+  --circuit_tracer_timeout_seconds 600 \
+  --no_word_report
+```
+
+#### Parameter Explanation for the Experiment:
+*   `--languages English,Yoruba,Igbo,Hausa,Swahili`: Sweeps across all low-resource African focus languages and the English control.
+*   `--include_benign_controls`: Enables benign control prompts to test steering specificity and detect over-refusal.
+*   `--max_eval_prompts 10` & `--max_benign_prompts 5`: Sets high-volume prompt counts for robust statistical significance.
+*   `--prompt_scaffolds baseline,...`: Sweeps across all five visible scaffolds.
+*   `--target_layers 12,16,20,24,25`: Sweeps optimization layers to map circuit depth and steering sensitivity.
+*   `--repeat_seeds 0,1,2`: Stabilizes and averages findings across three random seeds.
+*   `--enable_circuit_tracer`: Enrolls the tracer to extract mechanistic sub-graphs.
+*   `--circuit_tracer_auto_install`: Automatically handles the git clone and installation of `circuit-tracer`.
+*   `--circuit_tracer_max_graphs 15`: Captures up to 15 execution-path sub-graphs.
+
 ### Quick Start — Circuit Probe
 
 ```bash
@@ -439,6 +478,24 @@ flowchart LR
 
     Input --> Processing --> Output
 ```
+
+---
+
+## 📈 Large-Scale Experiment & Results
+
+We conducted a comprehensive, multi-seed evaluation across 5 languages, 5 scaffolds, and multiple target layers to map the distribution of cross-lingual safety circuits in `google/gemma-2-2b-it`.
+
+### 1. Clean Refusal Rates by Language and Scaffold
+The baseline safety alignment shows a major discrepancy between high-resource and low-resource languages. Scaffolding mechanisms such as `chain_safety` significantly improve the model's refusal rate on unsafe queries.
+
+![Clean Refusal Probability by Language and Scaffold](./african_language_with_tracer/bylanguage.png)
+
+### 2. Safety Awakening Gain by Optimization Layer
+Using sparse residual stream optimization, safety capability can be "awakened" even in layers that normally fail to refuse. Middle layers (e.g., layers 12 and 16) demonstrate massive steering gains, highlighting them as key causal loci for safety circuits.
+
+![Safety Awakening Gain by Optimization Layer](./african_language_with_tracer/byawake.png)
+
+*The above charts are generated directly from the experimental run outputs.*
 
 ---
 
