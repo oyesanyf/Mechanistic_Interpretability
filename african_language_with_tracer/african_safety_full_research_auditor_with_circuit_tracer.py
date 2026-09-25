@@ -1273,11 +1273,17 @@ def save_progress_checkpoint(results: list[CombinedPromptResult], out_dir: Path,
         print(f"[CHECKPOINT WARN] Could not write partial checkpoint: {type(exc).__name__}: {exc}", flush=True)
 
 
-def save_charts(summaries: list[CombinedSummary], out_dir: Path) -> None:
+def save_charts(
+    summaries: list[CombinedSummary],
+    out_dir: Path,
+    all_results: Optional[list[CombinedPromptResult]] = None,
+    charts_dir: Optional[Path | str] = "charts",
+) -> list[Path]:
     if not HAS_MPL:
         print("[SKIP] Charts not saved because matplotlib/numpy unavailable.")
-        return
-    # Chart 1: clean refusal by language/scaffold/kind
+        return []
+    chart_paths = []
+    # Legacy quick summary plots
     labels = [f"{s.language}\n{s.scaffold}\n{s.prompt_kind}" for s in summaries]
     clean = [s.mean_clean_refusal_prob for s in summaries]
     gains = [s.mean_safety_awakening_gain_best for s in summaries]
@@ -1290,8 +1296,10 @@ def save_charts(summaries: list[CombinedSummary], out_dir: Path) -> None:
     ax.set_title("Clean refusal probability by condition")
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(out_dir / "summary_clean_refusal_by_condition.png", dpi=160, bbox_inches="tight")
+    p1 = out_dir / "summary_clean_refusal_by_condition.png"
+    fig.savefig(p1, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    chart_paths.append(p1)
 
     fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.7), 5))
     ax.bar(x, gains)
@@ -1302,8 +1310,29 @@ def save_charts(summaries: list[CombinedSummary], out_dir: Path) -> None:
     ax.set_title("Best safety awakening gain by condition")
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(out_dir / "summary_best_awakening_gain_by_condition.png", dpi=160, bbox_inches="tight")
+    p2 = out_dir / "summary_best_awakening_gain_by_condition.png"
+    fig.savefig(p2, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    chart_paths.append(p2)
+
+    # High-resolution arXiv / Publication-grade Research Charts
+    if all_results:
+        try:
+            from research_plotter import generate_all_arxiv_figures
+            results_dicts = [asdict(r) for r in all_results]
+            summary_dicts = [asdict(s) for s in summaries]
+            arxiv_artifacts = generate_all_arxiv_figures(
+                prompt_results=results_dicts,
+                summaries=summary_dicts,
+                run_dir=out_dir,
+                charts_dir=charts_dir,
+            )
+            chart_paths.extend(arxiv_artifacts)
+            print(f"[ARXIV CHARTS] Successfully generated {len(arxiv_artifacts)} publication artifacts in {out_dir / 'charts'} and {charts_dir}.", flush=True)
+        except Exception as exc:
+            print(f"[ARXIV CHARTS WARN] Could not generate publication charts: {type(exc).__name__}: {exc}", flush=True)
+
+    return chart_paths
 
 
 
@@ -1813,11 +1842,8 @@ def save_artifacts_threaded(
 
     chart_paths = []
     if HAS_MPL:
-        save_charts(summaries, out_dir)
-        chart_paths = [
-            out_dir / 'summary_clean_refusal_by_condition.png',
-            out_dir / 'summary_best_awakening_gain_by_condition.png',
-        ]
+        charts_dir_arg = getattr(args, "charts_dir", "charts") if "args" in locals() and hasattr(args, "charts_dir") else "charts"
+        chart_paths = save_charts(summaries, out_dir, all_results=all_results, charts_dir=charts_dir_arg)
         for chart_path in chart_paths:
             print(f"Saved chart          : {chart_path.resolve()}", flush=True)
 
@@ -2319,6 +2345,7 @@ def parse_args():
     parser.add_argument("--out_dir", default="african_safety_research_outputs", help="Base output directory")
     parser.add_argument("--clean_out_dir", action="store_true", help="Delete the entire output folder before starting this run. This removes previous reports/runs.")
     parser.add_argument("--clean_run_dir", action="store_true", help="Delete only the resolved current run folder before starting this run.")
+    parser.add_argument("--charts_dir", default="charts", help="Output directory for arXiv-quality publication figures (default: charts/)")
     parser.add_argument("--no_word_report", action="store_true", help="Skip the Word .docx report even when python-docx is installed.")
     parser.add_argument("--no_timestamp_run_dir", action="store_true", help="Do not create a timestamped run subfolder")
     parser.add_argument("--compact_console", action="store_true", default=False, help="Print compact progress to avoid screen lock/freezing")
