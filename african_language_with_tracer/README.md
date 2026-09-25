@@ -1,6 +1,6 @@
 # 🌍 African Cross-Lingual Safety Auditor + Deep Noir RL Adaptive Steering
 
-This repository contains the mechanistic interpretability and safety steering suite for low-resource African languages (Yoruba, Igbo, Hausa, Swahili) alongside English controls.
+This repository contains the mechanistic interpretability and safety steering suite for low-resource African languages (Yoruba, Igbo, Hausa, Swahili, Zulu) alongside English controls.
 
 It combines:
 1. **Extended Research Auditor** (`african_safety_full_research_auditor_with_circuit_tracer.py`): Null-patching layer fragility (RPD), sparse residual-stream awakening, prompt scaffolding, and optional Circuit Tracer sub-graph extraction.
@@ -14,7 +14,8 @@ It combines:
 ```
                   ┌───────────────────────────────────────────────┐
                   │              Input Prompt x                   │
-                  │   (English, Yoruba, Igbo, Hausa, Swahili)     │
+                  │   (English, Yoruba, Igbo, Hausa, Swahili,     │
+                  │                    Zulu)                      │
                   └───────────────────────┬───────────────────────┘
                                           │
                                           ▼
@@ -98,7 +99,7 @@ To evaluate and compare all policies (`baseline`, `deep_noir_classic`, `bandit`,
 python run_deep_noir_rl.py \
   --model HuggingFaceTB/SmolLM2-135M-Instruct \
   --device auto \
-  --languages English,Yoruba,Igbo,Hausa,Swahili \
+  --languages English,Yoruba,Igbo,Hausa,Swahili,Zulu \
   --target_layers 8,14,20 \
   --policies baseline,deep_noir_classic,bandit,ppo \
   --max_eval_prompts 4 \
@@ -117,7 +118,7 @@ To run the extended research auditor with the RL Adaptive Steering Controller in
 python african_safety_full_research_auditor_with_circuit_tracer.py \
   --model HuggingFaceTB/SmolLM2-135M-Instruct \
   --device auto \
-  --languages English,Yoruba,Igbo,Hausa,Swahili \
+  --languages English,Yoruba,Igbo,Hausa,Swahili,Zulu \
   --include_benign_controls \
   --max_eval_prompts 5 \
   --max_benign_prompts 3 \
@@ -210,7 +211,7 @@ Adapted from [THUDM/ReST-RL](https://github.com/THUDM/ReST-RL) for African langu
    - Process Reward Model scoring reasoning states $V(s) \in [-1, 1]$.
    - Inference-time assisted decoding ensuring verified refusal on unsafe prompts and benign compliance on harmless prompts.
 3. **Multi-Dimensional African Language Verifiers**
-   - Yoruba, Hausa, Igbo, Swahili, and English refusal markers.
+   - Yoruba, Hausa, Igbo, Swahili, Zulu, and English refusal markers.
    - Benign preservation (penalizing over-refusal).
    - Jailbreak resistance (defending against DAN, prompt injection, system leakage).
    - Format fidelity & anti-looping safeguards.
@@ -219,17 +220,17 @@ Adapted from [THUDM/ReST-RL](https://github.com/THUDM/ReST-RL) for African langu
 
 ```bash
 # Stage 1: GRPO Policy Self-Training
-python run_rest_rl.py --stage grpo --languages English,Yoruba,Igbo,Hausa,Swahili --grpo_steps 5
+python run_rest_rl.py --stage grpo --languages English,Yoruba,Igbo,Hausa,Swahili,Zulu --grpo_steps 5
 
 # Stage 2: Value Model Training & VM-MCTS Search
-python run_rest_rl.py --stage vm_mcts --mcts_simulations 16 --mcts_depth 3
+python run_rest_rl.py --stage vm_mcts --languages English,Yoruba,Igbo,Hausa,Swahili,Zulu --mcts_simulations 16 --mcts_depth 3
 
 # Comparative Evaluation (Base vs ReST-GRPO vs VM-MCTS)
-python run_rest_rl.py --stage eval --languages English,Yoruba,Hausa
+python run_rest_rl.py --stage eval --languages English,Yoruba,Hausa,Zulu
 
 # Integration with Research Auditor
 python african_safety_full_research_auditor_with_circuit_tracer.py \
-  --languages English,Yoruba \
+  --languages English,Yoruba,Zulu \
   --enable_rest_rl \
   --rest_rl_mcts_sims 8
 ```
@@ -246,7 +247,7 @@ Adapted from [Anthropic's Jacobian Lens](https://github.com/anthropics/jacobian-
    $$J_\ell = \mathbb{E}\left[\frac{\partial h_{\text{final}}}{\partial h_\ell}\right]$$
    Maps intermediate layer states $h_\ell$ through model non-linearities into the verbalizable vocabulary space $W_U J_\ell$.
 2. **Multi-Token Refusal Phrase Vectors**:
-   Eliminates the 3–4 subword tokenizer fragmentation penalty in African languages by computing integrated latent phrase vectors $\mathbf{v}^J_{\text{refusal}, \ell}$ for complete expressions (*e.g., "Ba zan iya ba"*, *"Enweghị m ike"*).
+   Eliminates the 3–4 subword tokenizer fragmentation penalty in African languages by computing integrated latent phrase vectors $\mathbf{v}^J_{\text{refusal}, \ell}$ for complete expressions (*e.g., "Ba zan iya ba"*, *"Enweghị m ike"*, *"Angikwazi ukukusiza"*).
 3. **Coordinate-Restricted Surgical Steering (Part B)**:
    Restricts steering strictly to the verbalizable refusal subspace $W_U J_\ell$ with a hard norm bound ($L_2 \le 5.0$), eliminating brute-force activation blowouts ($L_2 \approx 28$) and preventing benign over-refusal.
 4. **Unverbalized J-Space Monitor & Clamper (Part D)**:
@@ -259,7 +260,7 @@ Adapted from [Anthropic's Jacobian Lens](https://github.com/anthropics/jacobian-
 python african_safety_full_research_auditor_with_circuit_tracer.py \
   --model HuggingFaceTB/SmolLM2-135M-Instruct \
   --device cpu \
-  --languages English,Yoruba,Igbo,Hausa,Swahili \
+  --languages English,Yoruba,Igbo,Hausa,Swahili,Zulu \
   --enable_jacobian_lens \
   --jacobian_layers 8,12,16 \
   --jacobian_awakening \
