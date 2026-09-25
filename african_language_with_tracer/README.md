@@ -1,60 +1,273 @@
-# 🌍 African Cross-Lingual Safety Auditor (Extended Circuit-Tracer Variant)
+# 🌍 African Cross-Lingual Safety Auditor + Deep Noir RL Adaptive Steering
 
-This directory contains the **extended research auditor** (`african_safety_full_research_auditor_with_circuit_tracer.py`) which integrates the `circuit-tracer` toolkit to perform dynamic hook-based activation mapping and generate sub-graphs of safety pathways in low-resource African languages.
+This repository contains the mechanistic interpretability and safety steering suite for low-resource African languages (Yoruba, Igbo, Hausa, Swahili) alongside English controls.
+
+It combines:
+1. **Extended Research Auditor** (`african_safety_full_research_auditor_with_circuit_tracer.py`): Null-patching layer fragility (RPD), sparse residual-stream awakening, prompt scaffolding, and optional Circuit Tracer sub-graph extraction.
+2. **Deep Noir Replication**: Mechanistic layer ranking via Logit Lens and antagonist-head scoring, causal gradient head attribution, contrastive steering directions, golden-section magnitude search, and rollback on accuracy loss.
+3. **Security-Constrained Adaptive Activation Steering (RL Controller)**: An RL controller (Contextual Bandit or Constrained PPO) that dynamically selects the smallest effective intervention per input while minimizing prompt-injection vulnerability and preserving unrelated model capabilities.
 
 ---
 
-## 🚀 Running the Replication Experiment
+## 🔬 Core System Architecture
 
-To replicate the large-scale evaluation across 5 languages, 5 scaffolds, and multiple seeds with active circuit tracing:
+```
+                  ┌───────────────────────────────────────────────┐
+                  │              Input Prompt x                   │
+                  │   (English, Yoruba, Igbo, Hausa, Swahili)     │
+                  └───────────────────────┬───────────────────────┘
+                                          │
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │       RL State Extractor        │
+                         │   - Sequence Length & Language  │
+                         │   - Early/Mid/Late Layer Norms  │
+                         │   - Logit Lens Refusal Emergence│
+                         │   - Antagonist Head Score       │
+                         │   - Confidence & Entropy Margin │
+                         │   - Prompt-Injection Risk Score │
+                         └────────────────┬────────────────┘
+                                          │ State s in R^15
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │      RL Policy Controller       │
+                         │  [LinUCB Contextual Bandit /    │
+                         │   Constrained Lagrangian PPO]   │
+                         └────────────────┬────────────────┘
+                                          │ Candidate Action:
+                                          │ (Layer, Heads, Magnitude)
+                                          │ or "No Steering"
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │     Security Constraint Gate    │
+                         │  - Reject if InjRisk > tau_inj  │
+                         │  - Reject if BenignOverRefusal  │
+                         └────────────────┬────────────────┘
+                                          │ Safe Action
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │   Deep Noir Activation Hooks    │
+                         │    h_l <- h_l + alpha * v_hat   │
+                         └────────────────┬────────────────┘
+                                          │
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │    Graduated Reward Evaluator   │
+                         │ R = w_acc*S_acc - w_inj*S_inj   │
+                         │     + w_cap*S_cap - w_cost*Cost │
+                         └────────────────┬────────────────┘
+                                          │
+                                          ▼
+                         ┌─────────────────────────────────┐
+                         │  Rollback & Policy Online Update│
+                         └─────────────────────────────────┘
+```
+
+---
+
+## 📦 Deep Noir + RL Subsystem (`deep_noir_rl/`)
+
+The modular package `deep_noir_rl/` provides:
+
+*   **`hardware_profiler.py`**: Profiles available system RAM (e.g. 224 GB high-memory mode), VRAM, and CPU physical/logical cores; configures optimal thread pools and execution batches.
+*   **`graduated_rewards.py`**: Multi-objective continuous dense reward evaluator:
+    $$R = w_{\text{acc}} S_{\text{acc}} - w_{\text{inj}} S_{\text{inj}} + w_{\text{cap}} S_{\text{cap}} - w_{\text{cost}} S_{\text{cost}}$$
+    with hard certification barriers that reject interventions exceeding prompt-injection vulnerability or causing benign over-refusal.
+*   **`logit_lens.py`**: Projects intermediate transformer residual states through the model's unembedding matrix ($W_U$) to track refusal emergence across depth. Computes **Antagonist-Head Scores** measuring attention heads whose direct output opposes safety refusal.
+*   **`gradient_attribution.py`**: Identifies causally critical attention heads using backward gradient-activation attribution:
+    $$\text{Attr}(l, h) = \left| \frac{\partial \mathcal{L}_{\text{refusal}}}{\partial o_{l, h}} \cdot o_{l, h} \right|$$
+*   **`contrastive_steering.py`**: Computes contrastive steering directions from safe vs harmful prompts per language:
+    $$\mathbf{v}_l = \mathbb{E}_{D_{\text{safe}}}[h_l] - \mathbb{E}_{D_{\text{harmful}}}[h_l], \quad \mathbf{\hat{v}}_l = \frac{\mathbf{v}_l}{\|\mathbf{v}_l\|_2}$$
+    and manages forward PyTorch hooks on residual streams and attention heads.
+*   **`golden_section_search.py`**: Classic Deep Noir baseline searching optimal static magnitude $\alpha \in [\alpha_{\min}, \alpha_{\max}]$ with automatic rollback on benign degradation.
+*   **`state_extractor.py`**: Featurizes prompt inputs, intermediate activations, Logit Lens refusal margins, model confidence, and heuristic prompt-injection risk indicators into a normalized state vector $s \in \mathbb{R}^{15}$.
+*   **`bandit_controller.py`**: LinUCB Contextual Bandit selecting per-input steering configurations with upper confidence bound exploration $c(t)$.
+*   **`ppo_controller.py`**: Constrained PPO Actor-Critic controller enforcing safety cost limits via adaptive Lagrangian multipliers $\lambda$.
+*   **`controller.py`**: `AdaptiveSteeringRLController` integrating all components into an end-to-end adaptive steering engine.
+*   **`evaluator.py`**: Comparative benchmark harness contrasting Baseline vs Classic Deep Noir vs Contextual Bandit vs Constrained PPO.
+
+---
+
+## 🚀 Running Deep Noir + RL
+
+### 1. Comparative Experiment Benchmark CLI
+
+To evaluate and compare all policies (`baseline`, `deep_noir_classic`, `bandit`, `ppo`) across African languages:
+
+```bash
+python run_deep_noir_rl.py \
+  --model HuggingFaceTB/SmolLM2-135M-Instruct \
+  --device auto \
+  --languages English,Yoruba,Igbo,Hausa,Swahili \
+  --target_layers 8,14,20 \
+  --policies baseline,deep_noir_classic,bandit,ppo \
+  --max_eval_prompts 4 \
+  --max_benign_prompts 2
+```
+
+Outputs summary tables, `benchmark_summary.json`, and prompt-level `benchmark_details.csv`.
+
+---
+
+### 2. Full Research Auditor with RL Controller Active
+
+To run the extended research auditor with the RL Adaptive Steering Controller integrated:
 
 ```bash
 python african_safety_full_research_auditor_with_circuit_tracer.py \
+  --model HuggingFaceTB/SmolLM2-135M-Instruct \
+  --device auto \
   --languages English,Yoruba,Igbo,Hausa,Swahili \
   --include_benign_controls \
-  --max_eval_prompts 10 \
-  --max_benign_prompts 5 \
-  --prompt_scaffolds baseline,safety_rubric,multi_option,chain_safety,tree_safety \
-  --target_layers 12,16,20,24,25 \
-  --repeat_seeds 0,1,2 \
-  --n_calibration 10 \
-  --awakening_steps 25 \
-  --device auto \
-  --torch_dtype auto \
-  --enable_circuit_tracer \
-  --circuit_tracer_auto_install \
-  --circuit_tracer_max_graphs 15 \
-  --circuit_tracer_select balanced \
-  --circuit_tracer_batch_size 16 \
-  --circuit_tracer_timeout_seconds 600 \
+  --max_eval_prompts 5 \
+  --max_benign_prompts 3 \
+  --prompt_scaffolds baseline,chain_safety,tree_safety \
+  --target_layers 8,14,20 \
+  --enable_rl_controller \
+  --rl_policy bandit \
+  --rl_exploration_c 1.25 \
+  --repeat_seeds 0,1 \
   --no_word_report
 ```
 
-### ⚙️ Command Parameter Breakdown
-*   `--languages English,Yoruba,Igbo,Hausa,Swahili`: Sweeps across all four focus low-resource African languages plus the English control.
-*   `--include_benign_controls`: Enables benign control prompts to test steering specificity and detect over-refusal.
-*   `--max_eval_prompts 10` & `--max_benign_prompts 5`: Sets high-volume prompt counts for robust statistical significance.
-*   `--prompt_scaffolds baseline,...`: Sweeps across all five visible safety scaffolds (`baseline`, `safety_rubric`, `multi_option`, `chain_safety`, `tree_safety`).
-*   `--target_layers 12,16,20,24,25`: Probes steering mutations at various intermediate layers to map circuit depth.
-*   `--repeat_seeds 0,1,2`: Runs three random seeds to stabilize and average findings.
-*   `--enable_circuit_tracer`: Enrolls the `circuit-tracer` engine to capture sub-graph circuits during evaluation.
-*   `--circuit_tracer_auto_install`: Automatically clones and sets up the `circuit-tracer` dependency.
-*   `--circuit_tracer_max_graphs 15`: Dynamically renders up to 15 execution path causal sub-graphs.
-*   `--circuit_tracer_select balanced`: Selects representative prompts with balanced outcomes for tracing.
-*   `--no_word_report`: Disables Word `.docx` generation to streamline execution.
+---
+
+## 🧪 Running the Complete Test Suite
+
+The test suite validates every component against real transformer models and verification assertions:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+Individual test modules:
+*   `tests/test_hardware_profiler.py`: Memory detection, thread tuning, resource tiers.
+*   `tests/test_graduated_rewards.py`: Multi-objective signals, injection risk gates, over-refusal barriers.
+*   `tests/test_logit_lens_and_antagonist.py`: Intermediate logit projection, refusal margins, antagonist heads.
+*   `tests/test_gradient_attribution.py`: Causal attention head attribution via backward gradients.
+*   `tests/test_contrastive_and_hooks.py`: Contrastive vector extraction, unit normalization, hook cleanup.
+*   `tests/test_golden_section_search.py`: Golden-section magnitude optimization and safety rollback.
+*   `tests/test_state_extractor.py`: Feature extraction in $\mathbb{R}^{15}$, jailbreak heuristics, entropy spikes.
+*   `tests/test_bandit_and_ppo.py`: LinUCB matrix updates and Constrained PPO Lagrangian updates.
+*   `tests/test_adaptive_controller_integration.py`: End-to-end adaptive controller forward pass and rewards.
+*   `tests/test_auditor_cli_integration.py`: Full auditor CLI integration with `--enable_rl_controller`.
+*   `tests/test_rest_verifiers.py`: Multi-dimensional African language refusal, benign compliance, and jailbreak rubrics.
+*   `tests/test_grpo_advantages_and_loss.py`: ReST-GRPO group advantage normalization, surrogate clipping, and KL penalties.
+*   `tests/test_rest_sampler.py`: ReST group sampling, on-the-fly verification, and deliberative scaffolds.
+*   `tests/test_mcts_search.py`: PUCT node selection, thought expansion, simulation, and backpropagation.
+*   `tests/test_value_model.py`: SafetyValueHead, Feature PRM, and MCTS trace-based MSE training.
+*   `tests/test_vm_mcts_assisted_decoding.py`: End-to-end VM-MCTS deliberative inference decoding across African languages.
+*   `tests/test_rest_rl_cli.py`: Integration testing for `run_rest_rl.py` runner CLI.
+*   `tests/test_auditor_rest_rl_integration.py`: Full auditor CLI integration with `--enable_rest_rl`.
+*   `tests/test_jacobian_lens.py`: Comprehensive unit and integration tests for Jacobian Lens transport estimation, decoding, multi-token phrase vectors, surgical awakening, and auditor integration.
 
 ---
 
-## 📈 Large-Scale Experiment Results
+## 🔬 Jacobian Lens Subsystem (`jacobian_lens/`)
 
-### 1. Clean Refusal Rates by Language and Scaffold
-The baseline safety alignment shows a major discrepancy between high-resource and low-resource languages. Scaffolding mechanisms such as `chain_safety` significantly improve the model's refusal rate on unsafe queries.
+Inspired by Anthropic's reference implementation ([anthropics/jacobian-lens](https://github.com/anthropics/jacobian-lens)), the `jacobian_lens/` package resolves core methodological bottlenecks in cross-lingual safety analysis:
 
-![Clean Refusal Probability by Language and Scaffold](bylanguage.png)
+1. **Eliminates Tokenizer Fragmentation**: Computes integrated latent vectors $t_w^{(\ell)}$ for complete African language refusal phrases (e.g. *"Ba zan iya ba"*, *"Enweghị m ike"*, *"Emi ko le"*), bypassing single-token fragmentation penalties.
+2. **Solves the Brute-Force Norm Problem**: Identifies the verbalizable coordinate frame $W_U J_\ell$ and restricts perturbations strictly to the refusal subspace:
+   $$h'_\ell = h_\ell + \alpha \cdot v_{\text{refusal}, \ell}^J, \quad \text{s.t. } \|\alpha v^J\|_2 \le 5.0$$
+   eliminating the severe over-refusal and brute-force mutations ($L_2 \approx 26 - 32$).
+3. **Bridges Circuit Discovery and ReST-RL VM-MCTS**: Operates as an unverbalized state monitor during rollout generation, detecting latent harmful intent at intermediate layers (e.g., L12) and applying dynamic activation clamping as a search operator.
 
-### 2. Safety Awakening Gain by Optimization Layer
-Using sparse residual stream optimization, safety capability can be "awakened" even in layers that normally fail to refuse. Middle layers (e.g., layers 12 and 16) demonstrate massive steering gains, highlighting them as key causal loci for safety circuits.
+### Core Components
 
-![Safety Awakening Gain by Optimization Layer](byawake.png)
+*   **`estimator.py`**: Matrix transport estimator $J_\ell = \mathbb{E}[\partial h_{\text{final}} / \partial h_\ell]$. Supports exact small-batch VJP, Monte Carlo / Hutchinson random projections, and empirical affine regression.
+*   **`lens.py`**: `JacobianLens` providing vocabulary space decoding ($W_U J_\ell$), single-token extraction, multi-token phrase integration, and disk serialization/caching.
+*   **`steering.py`**: Coordinate-restricted surgical steering ($L_2 \le 5.0$), Section 2.5 coordinate subspace patching $h_{\text{patched}} = h + V(\sigma(c) - c)$, `JacobianAwakener`, and `DynamicActivationClamper`.
 
-*Charts generated directly from the experimental run.*
+### CLI Usage
+
+```bash
+python african_safety_full_research_auditor_with_circuit_tracer.py \
+  --languages English,Yoruba,Hausa \
+  --enable_jacobian_lens \
+  --jacobian_layers 8,12,16 \
+  --jacobian_awakening \
+  --jacobian_method monte_carlo \
+  --jacobian_projections 16 \
+  --enable_rest_rl \
+  --rest_rl_mcts_sims 8
+```
+
+---
+
+## 🚀 ReST-RL: Self-Training (ReST-GRPO) & Value-Guided Decoding (VM-MCTS)
+
+Adapted from [THUDM/ReST-RL](https://github.com/THUDM/ReST-RL) for African language safety and deliberative reasoning.
+
+### Architecture
+
+1. **Stage 1: ReST-GRPO Policy Self-Training**
+   - Eliminates critic models by computing group-relative normalized advantages:
+     $$A_i = \frac{R_i - \text{mean}(R)}{\text{std}(R) + \epsilon}$$
+   - Surrogate policy clipping ($\epsilon_{\text{clip}} = 0.2$) and KL penalty ($\beta \cdot D_{\text{KL}}$) against reference policy $\pi_{\text{ref}}$.
+2. **Stage 2: Process Value Model (PRM) & VM-MCTS Assisted Decoding**
+   - Step-level Monte Carlo Tree Search exploring deliberative reasoning thoughts (`<thought>...</thought>`).
+   - Process Reward Model scoring reasoning states $V(s) \in [-1, 1]$.
+   - Inference-time assisted decoding ensuring verified refusal on unsafe prompts and benign compliance on harmless prompts.
+3. **Multi-Dimensional African Language Verifiers**
+   - Yoruba, Hausa, Igbo, Swahili, and English refusal markers.
+   - Benign preservation (penalizing over-refusal).
+   - Jailbreak resistance (defending against DAN, prompt injection, system leakage).
+   - Format fidelity & anti-looping safeguards.
+
+### CLI Usage
+
+```bash
+# Stage 1: GRPO Policy Self-Training
+python run_rest_rl.py --stage grpo --languages English,Yoruba,Igbo,Hausa,Swahili --grpo_steps 5
+
+# Stage 2: Value Model Training & VM-MCTS Search
+python run_rest_rl.py --stage vm_mcts --mcts_simulations 16 --mcts_depth 3
+
+# Comparative Evaluation (Base vs ReST-GRPO vs VM-MCTS)
+python run_rest_rl.py --stage eval --languages English,Yoruba,Hausa
+
+# Integration with Research Auditor
+python african_safety_full_research_auditor_with_circuit_tracer.py \
+  --languages English,Yoruba \
+  --enable_rest_rl \
+  --rest_rl_mcts_sims 8
+```
+
+---
+
+## 🔍 Anthropic Jacobian Lens Subsystem (`jacobian_lens/`)
+
+Adapted from [Anthropic's Jacobian Lens](https://github.com/anthropics/jacobian-lens) reference implementation to resolve low-resource tokenizer fragmentation and enable coordinate-restricted surgical activation steering.
+
+### Core Capabilities
+
+1. **Jacobian Transport Matrix Estimation**:
+   $$J_\ell = \mathbb{E}\left[\frac{\partial h_{\text{final}}}{\partial h_\ell}\right]$$
+   Maps intermediate layer states $h_\ell$ through model non-linearities into the verbalizable vocabulary space $W_U J_\ell$.
+2. **Multi-Token Refusal Phrase Vectors**:
+   Eliminates the 3–4 subword tokenizer fragmentation penalty in African languages by computing integrated latent phrase vectors $\mathbf{v}^J_{\text{refusal}, \ell}$ for complete expressions (*e.g., "Ba zan iya ba"*, *"Enweghị m ike"*).
+3. **Coordinate-Restricted Surgical Steering (Part B)**:
+   Restricts steering strictly to the verbalizable refusal subspace $W_U J_\ell$ with a hard norm bound ($L_2 \le 5.0$), eliminating brute-force activation blowouts ($L_2 \approx 28$) and preventing benign over-refusal.
+4. **Unverbalized J-Space Monitor & Clamper (Part D)**:
+   Scans intermediate layers during ReST-RL VM-MCTS rollouts to detect harmful concepts before token emission and triggers dynamic activation clamping when necessary.
+
+### CLI Usage
+
+```bash
+# Run Full Auditor with Jacobian Lens & Surgical Awakening
+python african_safety_full_research_auditor_with_circuit_tracer.py \
+  --model HuggingFaceTB/SmolLM2-135M-Instruct \
+  --device cpu \
+  --languages English,Yoruba,Igbo,Hausa,Swahili \
+  --enable_jacobian_lens \
+  --jacobian_layers 8,12,16 \
+  --jacobian_awakening \
+  --max_mutation_norm 5.0 \
+  --enable_rest_rl \
+  --rest_rl_mcts_sims 8 \
+  --rest_rl_mcts_depth 3 \
+  --no_word_report
+```
+
+
