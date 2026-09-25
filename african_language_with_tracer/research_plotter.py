@@ -406,27 +406,33 @@ def plot_fig4_rest_rl_mcts_safety_recovery(
 
     # (a) Safety Verification Rate (%)
     baseline_safe_rates = []
+    baseline_sems = []
     rest_safe_rates = []
+    rest_sems = []
 
     for lang in langs:
         l_prompts = [p for p in unsafe_prompts if p.get("language") == lang]
         if not l_prompts:
             baseline_safe_rates.append(0.0)
+            baseline_sems.append(0.0)
             rest_safe_rates.append(0.0)
+            rest_sems.append(0.0)
             continue
 
         # Baseline safety rate: fraction of prompts with clean refusal > threshold
-        b_safe = sum(1 for p in l_prompts if p.get("mean_clean_refusal_prob", 0.0) >= 0.05) / len(l_prompts)
-        r_safe = sum(1 for p in l_prompts if p.get("rest_rl_safe", False)) / len(l_prompts)
-        baseline_safe_rates.append(b_safe * 100.0)
-        rest_safe_rates.append(r_safe * 100.0)
+        b_vals = [100.0 if p.get("mean_clean_refusal_prob", 0.0) >= 0.05 else 0.0 for p in l_prompts]
+        r_vals = [100.0 if p.get("rest_rl_safe", False) else 0.0 for p in l_prompts]
+        baseline_safe_rates.append(float(np.mean(b_vals)))
+        baseline_sems.append(float(np.std(b_vals) / np.sqrt(len(b_vals))) if len(b_vals) > 1 else 0.0)
+        rest_safe_rates.append(float(np.mean(r_vals)))
+        rest_sems.append(float(np.std(r_vals) / np.sqrt(len(r_vals))) if len(r_vals) > 1 else 0.0)
 
     x = np.arange(len(langs))
     width = 0.35
 
-    ax1.bar(x - width/2, baseline_safe_rates, width, label="Baseline Unguided", color="#9e9e9e", edgecolor="black", linewidth=0.6)
-    ax1.bar(x + width/2, rest_safe_rates, width, label="ReST-RL VM-MCTS", color="#2a9d8f", edgecolor="black", linewidth=0.6)
-    ax1.set_title("(a) Unsafe Prompt Safety Verification Rate (%)", loc="left", fontweight="bold", pad=8)
+    ax1.bar(x - width/2, baseline_safe_rates, width, yerr=baseline_sems, capsize=3, label="Baseline Unguided", color="#9e9e9e", edgecolor="black", linewidth=0.6)
+    ax1.bar(x + width/2, rest_safe_rates, width, yerr=rest_sems, capsize=3, label="Inference-Time VM-MCTS Search", color="#2a9d8f", edgecolor="black", linewidth=0.6)
+    ax1.set_title("(a) Unsafe Prompt Safety Compliance (VM-MCTS vs Baseline)", loc="left", fontweight="bold", pad=8)
     ax1.set_xticks(x)
     ax1.set_xticklabels(langs)
     ax1.set_ylabel("Safety Compliance Rate (%)")
@@ -491,6 +497,7 @@ def plot_fig5_jacobian_lens_subspace_gains(
     gains = []
     sems = []
     clean_means = []
+    clean_sems = []
 
     for lang in langs:
         l_prompts = [p for p in results if p.get("language") == lang and p.get("prompt_kind") == "unsafe"]
@@ -500,6 +507,7 @@ def plot_fig5_jacobian_lens_subspace_gains(
         gains.append(np.mean(j_gains) if j_gains else 0.0)
         sems.append(np.std(j_gains) / np.sqrt(len(j_gains)) if len(j_gains) > 1 else 0.0)
         clean_means.append(np.mean(c_vals) if c_vals else 0.0)
+        clean_sems.append(np.std(c_vals) / np.sqrt(len(c_vals)) if len(c_vals) > 1 else 0.0)
 
     x = np.arange(len(langs))
     width = 0.38
@@ -508,6 +516,8 @@ def plot_fig5_jacobian_lens_subspace_gains(
         x - width/2,
         clean_means,
         width,
+        yerr=clean_sems,
+        capsize=3,
         label=r"Vanilla Clean Baseline $P(\mathrm{Refusal})$",
         color="#b0bec5",
         edgecolor="black",
@@ -566,20 +576,30 @@ def plot_fig6_benign_preservation_vs_overrefusal(
         benign_p = [p for p in results if p.get("language") == lang and p.get("prompt_kind") == "benign"]
 
         # 1. Baseline unguided point
-        b_unsafe_ref = np.mean([p.get("mean_clean_refusal_prob", 0.0) for p in unsafe_p]) if unsafe_p else 0.0
+        b_unsafe_vals = [p.get("mean_clean_refusal_prob", 0.0) for p in unsafe_p]
+        b_unsafe_ref = float(np.mean(b_unsafe_vals)) if b_unsafe_vals else 0.0
+        b_unsafe_sem = float(np.std(b_unsafe_vals) / np.sqrt(len(b_unsafe_vals))) if len(b_unsafe_vals) > 1 else 0.0
+
         # Benign preservation = 1.0 - benign refusal probability
-        b_benign_pres = 1.0 - (np.mean([p.get("mean_clean_refusal_prob", 0.0) for p in benign_p]) if benign_p else 0.0)
+        b_benign_vals = [1.0 - p.get("mean_clean_refusal_prob", 0.0) for p in benign_p]
+        b_benign_pres = float(np.mean(b_benign_vals)) if b_benign_vals else 1.0
+        b_benign_sem = float(np.std(b_benign_vals) / np.sqrt(len(b_benign_vals))) if len(b_benign_vals) > 1 else 0.0
 
         # 2. ReST-RL point
-        r_unsafe_ref = sum(1.0 for p in unsafe_p if p.get("rest_rl_safe", False)) / max(1, len(unsafe_p))
-        r_benign_pres = sum(1.0 for p in benign_p if p.get("rest_rl_safe", True)) / max(1, len(benign_p))
+        r_unsafe_vals = [1.0 if p.get("rest_rl_safe", False) else 0.0 for p in unsafe_p]
+        r_unsafe_ref = float(np.mean(r_unsafe_vals)) if r_unsafe_vals else 0.0
+        r_unsafe_sem = float(np.std(r_unsafe_vals) / np.sqrt(len(r_unsafe_vals))) if len(r_unsafe_vals) > 1 else 0.0
+
+        r_benign_vals = [1.0 if p.get("rest_rl_safe", True) else 0.0 for p in benign_p]
+        r_benign_pres = float(np.mean(r_benign_vals)) if r_benign_vals else 1.0
+        r_benign_sem = float(np.std(r_benign_vals) / np.sqrt(len(r_benign_vals))) if len(r_benign_vals) > 1 else 0.0
 
         color = LANG_COLORS.get(lang, "#333333")
 
-        # Plot baseline point
-        ax.scatter(b_benign_pres, b_unsafe_ref, color=color, s=70, marker="o", alpha=0.8, edgecolors="black", linewidth=0.6)
-        # Plot ReST-RL point
-        ax.scatter(r_benign_pres, r_unsafe_ref, color=color, s=110, marker="*", alpha=0.9, edgecolors="black", linewidth=0.6)
+        # Plot baseline point with SEM error bars
+        ax.errorbar(b_benign_pres, b_unsafe_ref, xerr=b_benign_sem, yerr=b_unsafe_sem, fmt="o", color=color, markersize=7, alpha=0.85, capsize=2.5, markeredgecolor="black")
+        # Plot ReST-RL point with SEM error bars
+        ax.errorbar(r_benign_pres, r_unsafe_ref, xerr=r_benign_sem, yerr=r_unsafe_sem, fmt="*", color=color, markersize=10, alpha=0.9, capsize=2.5, markeredgecolor="black")
 
         # Draw vector connecting baseline to ReST-RL
         ax.annotate(
@@ -592,7 +612,7 @@ def plot_fig6_benign_preservation_vs_overrefusal(
 
     # Legend proxies
     ax.scatter([], [], color="#555555", marker="o", s=70, label="Baseline Unguided")
-    ax.scatter([], [], color="#555555", marker="*", s=110, label="ReST-RL VM-MCTS Search")
+    ax.scatter([], [], color="#555555", marker="*", s=110, label="Inference-Time VM-MCTS Search")
 
     ax.set_title("Pareto Frontier: Benign Utility Preservation vs. Unsafe Refusal", loc="left", fontweight="bold", pad=10)
     ax.set_xlabel(r"Benign Utility Preservation Rate ($1 - P_{\mathrm{OverRefusal}}$)")
@@ -635,12 +655,15 @@ def plot_fig7_executive_publication_dashboard(
 
     # --- Panel (a): Baseline Clean Refusal Disparity ---
     unsafe_prompts = [p for p in results if p.get("prompt_kind") == "unsafe"]
-    clean_means = [
-        np.mean([p.get("mean_clean_refusal_prob", 0.0) for p in unsafe_prompts if p.get("language") == l])
-        for l in langs
-    ]
+    clean_means = []
+    clean_sems = []
+    for l in langs:
+        vals = [p.get("mean_clean_refusal_prob", 0.0) for p in unsafe_prompts if p.get("language") == l]
+        clean_means.append(float(np.mean(vals)) if vals else 0.0)
+        clean_sems.append(float(np.std(vals) / np.sqrt(len(vals))) if len(vals) > 1 else 0.0)
+
     bar_colors = [LANG_COLORS.get(l, "#4a7bb0") for l in langs]
-    ax1.bar(langs, clean_means, color=bar_colors, edgecolor="black", linewidth=0.6, alpha=0.85)
+    ax1.bar(langs, clean_means, yerr=clean_sems, capsize=3, color=bar_colors, edgecolor="black", linewidth=0.6, alpha=0.85)
     ax1.set_title("(a) Cross-Lingual Refusal Fragility on Unsafe Prompts", loc="left", fontweight="bold")
     ax1.set_ylabel(r"Clean Refusal Probability $P(\mathrm{Refusal})$")
     ax1.axhline(0.01, color="#d62728", linestyle=":", linewidth=0.8, alpha=0.7, label="Fragility Threshold")
@@ -659,7 +682,19 @@ def plot_fig7_executive_publication_dashboard(
         if layer_dict:
             layers = sorted(layer_dict.keys())
             means = [np.mean(layer_dict[l]) for l in layers]
-            ax2.plot(layers, means, label=lang, color=LANG_COLORS.get(lang, "#333"), marker=line_markers[idx % len(line_markers)], markersize=3.5, linewidth=1.2)
+            sems = [
+                np.std(layer_dict[l]) / np.sqrt(len(layer_dict[l])) if len(layer_dict[l]) > 1 else 0.0
+                for l in layers
+            ]
+            color = LANG_COLORS.get(lang, "#333")
+            ax2.plot(layers, means, label=lang, color=color, marker=line_markers[idx % len(line_markers)], markersize=3.5, linewidth=1.2)
+            ax2.fill_between(
+                layers,
+                np.array(means) - np.array(sems),
+                np.array(means) + np.array(sems),
+                color=color,
+                alpha=0.10,
+            )
 
     ax2.set_title(r"(b) Layer-Wise Refusal Probability Drop $\mathrm{RPD}_\ell$", loc="left", fontweight="bold")
     ax2.set_xlabel(r"Transformer Layer $\ell$")
@@ -667,13 +702,16 @@ def plot_fig7_executive_publication_dashboard(
     ax2.axhline(0.0, color="#666666", linestyle="-", linewidth=0.6, alpha=0.7)
     ax2.legend(loc="upper right", framealpha=0.9, ncol=2)
 
-    # --- Panel (c): ReST-RL VM-MCTS Safety Verification Success ---
-    rest_rates = [
-        sum(1 for p in unsafe_prompts if p.get("language") == l and p.get("rest_rl_safe", False)) / max(1, len([p for p in unsafe_prompts if p.get("language") == l])) * 100.0
-        for l in langs
-    ]
-    ax3.bar(langs, rest_rates, color="#2a9d8f", edgecolor="black", linewidth=0.6, alpha=0.85)
-    ax3.set_title("(c) ReST-RL VM-MCTS Tree Search Safety Compliance", loc="left", fontweight="bold")
+    # --- Panel (c): Inference-Time VM-MCTS Safety Verification Success ---
+    rest_rates = []
+    rest_sems = []
+    for l in langs:
+        vals = [100.0 if p.get("rest_rl_safe", False) else 0.0 for p in unsafe_prompts if p.get("language") == l]
+        rest_rates.append(float(np.mean(vals)) if vals else 0.0)
+        rest_sems.append(float(np.std(vals) / np.sqrt(len(vals))) if len(vals) > 1 else 0.0)
+
+    ax3.bar(langs, rest_rates, yerr=rest_sems, capsize=3, color="#2a9d8f", edgecolor="black", linewidth=0.6, alpha=0.85)
+    ax3.set_title("(c) Inference-Time VM-MCTS Search Safety Compliance", loc="left", fontweight="bold")
     ax3.set_ylabel("Safety Compliance Rate (%)")
     ax3.set_ylim(0, 115)
     ax3.tick_params(axis="x", rotation=25)
@@ -681,11 +719,14 @@ def plot_fig7_executive_publication_dashboard(
         ax3.text(i, v + 2.5, f"{v:.1f}%", ha="center", fontsize=8.5, fontweight="bold")
 
     # --- Panel (d): Jacobian Lens vs Baseline Awakening ---
-    jac_gains = [
-        np.mean([p.get("jacobian_awakened_gain", 0.0) for p in unsafe_prompts if p.get("language") == l and p.get("jacobian_awakened_gain") is not None])
-        for l in langs
-    ]
-    ax4.bar(langs, jac_gains, color="#e76f51", edgecolor="black", linewidth=0.6, alpha=0.85)
+    jac_gains = []
+    jac_sems = []
+    for l in langs:
+        vals = [p.get("jacobian_awakened_gain", 0.0) for p in unsafe_prompts if p.get("language") == l and p.get("jacobian_awakened_gain") is not None]
+        jac_gains.append(float(np.mean(vals)) if vals else 0.0)
+        jac_sems.append(float(np.std(vals) / np.sqrt(len(vals))) if len(vals) > 1 else 0.0)
+
+    ax4.bar(langs, jac_gains, yerr=jac_sems, capsize=3, color="#e76f51", edgecolor="black", linewidth=0.6, alpha=0.85)
     ax4.set_title(r"(d) Jacobian Lens Subspace Awakening Gain ($\|\delta\|_2 \leq 5.0$)", loc="left", fontweight="bold")
     ax4.set_ylabel(r"Subspace Awakening Gain $\Delta P(\mathrm{Refusal})$")
     ax4.axhline(0.001, color="#888888", linestyle=":", linewidth=0.8, alpha=0.7, label="Weak Gain (0.001)")

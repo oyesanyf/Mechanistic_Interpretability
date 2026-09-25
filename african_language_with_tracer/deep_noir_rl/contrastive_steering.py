@@ -241,6 +241,7 @@ class ContrastiveSteeringManager:
         unit_direction: Optional[torch.Tensor] = None,
         head_indices: Optional[List[int]] = None,
         is_verified_intervention: bool = False,
+        prompt_len: Optional[int] = None,
     ):
         """
         PyTorch forward hook intervention:
@@ -290,7 +291,8 @@ class ContrastiveSteeringManager:
                 h = out[0] if isinstance(out, tuple) else out
                 patched = h.clone()
                 delta = steering_delta.to(dtype=h.dtype, device=h.device)
-                patched[:, -1, :] = patched[:, -1, :] + delta
+                target_idx = (prompt_len - 1) if (prompt_len is not None and prompt_len <= h.shape[1]) else -1
+                patched[:, target_idx, :] = patched[:, target_idx, :] + delta
                 return (patched,) + out[1:] if isinstance(out, tuple) else patched
 
             handle = layer.register_forward_hook(residual_hook)
@@ -314,7 +316,8 @@ class ContrastiveSteeringManager:
                     h = out[0] if isinstance(out, tuple) else out
                     patched = h.clone()
                     delta = steering_delta.to(dtype=h.dtype, device=h.device)
-                    patched[:, -1, :] = patched[:, -1, :] + delta
+                    target_idx = (prompt_len - 1) if (prompt_len is not None and prompt_len <= h.shape[1]) else -1
+                    patched[:, target_idx, :] = patched[:, target_idx, :] + delta
                     return (patched,) + out[1:] if isinstance(out, tuple) else patched
 
                 handle = layer.register_forward_hook(residual_hook)
@@ -330,11 +333,12 @@ class ContrastiveSteeringManager:
                 def out_proj_pre_hook(_mod, args):
                     x = args[0].clone()
                     delta = steering_delta.to(dtype=x.dtype, device=x.device)
+                    target_idx = (prompt_len - 1) if (prompt_len is not None and prompt_len <= x.shape[1]) else -1
                     for h_idx in head_indices:
                         start = h_idx * head_dim
                         end = min(start + head_dim, x.shape[-1])
                         if start < x.shape[-1]:
-                            x[:, -1, start:end] = x[:, -1, start:end] + delta[start:end]
+                            x[:, target_idx, start:end] = x[:, target_idx, start:end] + delta[start:end]
                     return (x,) + args[1:]
 
                 handle = out_proj.register_forward_pre_hook(out_proj_pre_hook)
@@ -348,12 +352,13 @@ class ContrastiveSteeringManager:
                 h = out[0] if isinstance(out, tuple) else out
                 patched = h.clone()
                 delta = steering_delta.to(dtype=h.dtype, device=h.device)
+                target_idx = (prompt_len - 1) if (prompt_len is not None and prompt_len <= h.shape[1]) else -1
 
                 for h_idx in head_indices:
                     start = h_idx * head_dim
                     end = min(start + head_dim, patched.shape[-1])
                     if start < patched.shape[-1]:
-                        patched[:, -1, start:end] = patched[:, -1, start:end] + delta[start:end]
+                        patched[:, target_idx, start:end] = patched[:, target_idx, start:end] + delta[start:end]
 
                 return (patched,) + out[1:] if isinstance(out, tuple) else patched
 
