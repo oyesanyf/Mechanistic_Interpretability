@@ -358,5 +358,16 @@ python african_safety_full_research_auditor_with_circuit_tracer.py \
   --clean_out_dir
 ```
 
+---
+
+## 📑 Forensic Research Evidence & Findings Documents
+
+Every execution of the auditor produces self-contained, publication-grade forensic scientific evidence:
+
+1. **`run_log_<timestamp>.txt`**: The complete single-file execution log captured via real-time tee buffering. Contains untruncated input prompts, tokenized sequence IDs, multi-token likelihood scores, layer-by-layer RPD profiles, mutation norm bounds ($L_1, L_2, L_\infty$), top causal steering dimensions, untruncated generated model completions, LinUCB 10D state vectors, multi-objective reward breakdowns ($s_{\text{acc}}, s_{\text{inj}}, s_{\text{cap}}, s_{\text{cost}}$), rollback audit traces, and VM-MCTS deliberative reasoning steps. It concludes with the full embedded text of the Research Findings Report.
+2. **`RESEARCH_FINDINGS_<timestamp>.txt`**: Executive research findings document synthesizing the run into 5 comprehensive data tables (cross-lingual fragility profiles, surgical awakening gains, disentangled RL performance, VM-MCTS verification, and behavioral generation distributions), tokenizer fragmentation diagnostics, and per-language case highlights.
+3. **`audit_trace_<timestamp>.txt`**: Forensic step-by-step audit record covering every evaluated prompt with ASCII section borders, exact input prompts, mechanistic probe outputs, and behavioral completions.
+4. **`RUN_MANIFEST_<timestamp>.txt`**: Cryptographic index mapping every CSV, JSON, Markdown, Word, findings report, and publication figure generated during the audit.
+
 
 
