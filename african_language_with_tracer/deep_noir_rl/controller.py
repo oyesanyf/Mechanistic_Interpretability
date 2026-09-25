@@ -81,8 +81,8 @@ class AdaptiveSteeringRLController:
         self.layers = layers
         self.device = device or next(model.parameters()).device
         self.policy_type = policy_type.lower()
-        self.candidate_layers = candidate_layers or [12, 16, 20]
-        self.candidate_magnitudes = candidate_magnitudes or [5.0, 12.0, 20.0]
+        self.candidate_layers = candidate_layers or [8, 12]
+        self.candidate_magnitudes = candidate_magnitudes or [1.0, 2.5, 5.0]
 
         # 1. Hardware Profiling
         self.hardware = hardware_profile or HardwareProfiler.profile()

@@ -60,8 +60,8 @@ class ContextualBanditController:
         ridge_lambda: float = 1.0,
     ):
         self.state_dim = state_dim
-        self.candidate_layers = candidate_layers or [12, 16, 20]
-        self.candidate_magnitudes = candidate_magnitudes or [5.0, 12.0, 20.0]
+        self.candidate_layers = candidate_layers or [8, 12]
+        self.candidate_magnitudes = candidate_magnitudes or [1.0, 2.5, 5.0]
         self.include_head_subsets = include_head_subsets
         self.exploration_c = exploration_c
         self.min_exploration_c = min_exploration_c

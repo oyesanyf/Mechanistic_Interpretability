@@ -2616,6 +2616,11 @@ def main() -> None:
                 print("  Calibrating Deep Noir + RL Controllers by language:")
                 for li, language in enumerate(languages, start=1):
                     try:
+                        cand_mags = [
+                            round(0.25 * args.max_mutation_norm, 1),
+                            round(0.50 * args.max_mutation_norm, 1),
+                            round(args.max_mutation_norm, 1),
+                        ]
                         ctrl = AdaptiveSteeringRLController(
                             model=model,
                             tokenizer=tokenizer,
@@ -2623,6 +2628,7 @@ def main() -> None:
                             device=device,
                             policy_type=args.rl_policy,
                             candidate_layers=target_layers,
+                            candidate_magnitudes=cand_mags,
                             exploration_c=args.rl_exploration_c,
                             max_injection_risk=args.rl_max_injection_risk,
                             max_benign_refusal=args.rl_max_benign_refusal,
