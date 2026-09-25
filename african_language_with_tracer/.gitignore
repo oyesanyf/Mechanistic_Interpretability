@@ -9,5 +9,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 african_safety_research_outputs_LOCKED_*
+african_safety_research_outputs/
 .venv*/
 venv/

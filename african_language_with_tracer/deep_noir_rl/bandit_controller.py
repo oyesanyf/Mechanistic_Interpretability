@@ -82,6 +82,8 @@ class ContextualBanditController:
             for _ in range(self.num_actions)
         ]
         self.pull_counts: List[int] = [0] * self.num_actions
+        self.last_verified_arm_id: Optional[int] = None
+        self.last_verified_reward: Optional[float] = None
 
     def _build_action_space(self) -> List[SteeringAction]:
         """Constructs discrete action space including no-steering and parameter sweeps."""
@@ -140,9 +142,11 @@ class ContextualBanditController:
         reward: float,
         state_vector: Optional[torch.Tensor] = None,
         is_heads: bool = False,
+        confidence_weight: float = 5.0,
     ) -> Optional[int]:
         """
         Warm-starts / seeds a bandit arm with prior verified evidence (e.g. from Part B awakening).
+        Uses confidence_weight to ensure verified evidence is reflected in prior ridge parameters.
         """
         matching_idx = None
         if layer_idx is None or magnitude == 0.0:
@@ -168,12 +172,14 @@ class ContextualBanditController:
                 if s.dim() == 2:
                     s = s.squeeze(0)
                 s_norm = s / (torch.norm(s) + 1e-8)
-                self.A[matching_idx] += torch.outer(s_norm, s_norm)
-                self.b[matching_idx] += reward * s_norm
+                self.A[matching_idx] += confidence_weight * torch.outer(s_norm, s_norm)
+                self.b[matching_idx] += (confidence_weight * reward) * s_norm
             else:
-                self.b[matching_idx] += reward * (1.0 / math.sqrt(self.state_dim))
-            self.pull_counts[matching_idx] += 1
-            logger.info(f"Warm-started bandit arm {matching_idx} ({self.actions[matching_idx].name}) with prior reward {reward:+.4f}.")
+                self.b[matching_idx] += (confidence_weight * reward) * (1.0 / math.sqrt(self.state_dim))
+            self.pull_counts[matching_idx] += int(confidence_weight)
+            self.last_verified_arm_id = matching_idx
+            self.last_verified_reward = reward
+            logger.info(f"Warm-started bandit arm {matching_idx} ({self.actions[matching_idx].name}) with prior reward {reward:+.4f} (weight={confidence_weight}).")
             return matching_idx
         return None
 
@@ -183,17 +189,26 @@ class ContextualBanditController:
         active_causal_heads_by_layer: Optional[Dict[int, List[int]]] = None,
         prompt_kind: Optional[str] = None,
         preferred_layer: Optional[int] = None,
+        verified_arm_id: Optional[int] = None,
+        verified_gain: float = 0.0,
     ) -> BanditDecision:
-        """Selects action via LinUCB decision rule."""
+        """Selects action via LinUCB decision rule with safety-constrained exploration."""
         s = state_vector.detach().cpu().float()
         if s.dim() == 2:
             s = s.squeeze(0)
         s_norm = s / (torch.norm(s) + 1e-8)
 
+        # An arm is verified on THIS prompt IF AND ONLY IF verified_arm_id is provided and verified_gain > 0.
+        # If verified_gain <= 0 or verified_arm_id is None, no verified arm exists for this prompt.
+        has_verified_arm = (verified_arm_id is not None and verified_gain > 0)
+        if not has_verified_arm:
+            self.last_verified_arm_id = None
+            self.last_verified_reward = None
+
         c = self.get_current_exploration_c()
         scores: Dict[int, float] = {}
         best_action_id = 0
-        best_key = (-float("inf"), -1, -1, -1)
+        best_key = (-float("inf"), -1, -1, -1, -1)
         best_pred = 0.0
         best_uncert = 0.0
 
@@ -206,18 +221,35 @@ class ContextualBanditController:
             var = torch.dot(s_norm, torch.matmul(A_inv, s_norm)).item()
             uncertainty = math.sqrt(max(0.0, var))
 
-            if prompt_kind == "unsafe" and action.is_no_op:
-                # Clean baseline is known; no epistemic exploration bonus for inaction on unsafe prompts
-                score = pred
+            if prompt_kind == "unsafe":
+                if action.is_no_op:
+                    # Clean baseline is known; no epistemic exploration bonus for inaction on unsafe prompts
+                    score = pred
+                elif has_verified_arm:
+                    if a_idx == verified_arm_id:
+                        # Arm with verified intervention from Part B: proven safe efficacy
+                        score = pred + c * uncertainty
+                    else:
+                        # Safety-constrained exploration: unverified arms on unsafe prompts
+                        # must not blindly gamble with high exploration bonuses over a verified safe arm.
+                        # Exploration constant is strictly bounded to c_eff = min(c, 0.10) for all unverified arms.
+                        c_eff = min(c, 0.10)
+                        mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / 30.0))
+                        score = pred + c_eff * uncertainty - mag_cost
+                else:
+                    # General unsafe prompt without verified arm: penalize magnitude cost on unpulled arms
+                    mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / 30.0)) if self.pull_counts[a_idx] == 0 else 0.0
+                    score = pred + c * uncertainty - mag_cost
             else:
                 score = pred + c * uncertainty
             scores[a_idx] = score
 
-            # Tie-breaking key: score, then active intervention over inaction, preferred layer, full residual over heads
+            # Tie-breaking key: score, verified arm priority, active intervention over inaction, preferred layer, full residual over heads
+            is_verified = 1 if (has_verified_arm and a_idx == verified_arm_id) else 0
             is_active = 0 if (prompt_kind == "unsafe" and action.is_no_op) else 1
             is_pref = 1 if (preferred_layer is not None and action.layer_idx == preferred_layer) else 0
             is_full = 1 if (action.target_heads is None and not action.is_no_op) else 0
-            key = (round(score, 5), is_active, is_pref, is_full)
+            key = (round(score, 5), is_verified, is_active, is_pref, is_full)
 
             if key > best_key:
                 best_key = key

@@ -156,6 +156,96 @@ class TestPartBToCPipeline(unittest.TestCase):
         # Steered reward must be higher than no_op_reward
         self.assertGreater(rl_res.reward_breakdown.total_reward, no_op_reward.total_reward + 0.15)
 
+    def test_bandit_multi_magnitude_prioritizes_warm_start_under_default_exploration(self):
+        """
+        Verifies that with the full action space (magnitudes [5.0, 12.0, 20.0]) and default exploration_c=1.25,
+        the bandit selects L8_mag5.0_full instead of being swayed by exploration bonuses on L8_mag12.0_full.
+        """
+        yoruba = next(l for l in LANGUAGES if l["name"] == "Yoruba")
+        refusal_starts = yoruba["refusal_starts"] + yoruba["safe_starts"]
+        refusal_ids, _, _ = token_ids_for_starts(self.tokenizer, refusal_starts)
+
+        prompt_text = build_prompt(yoruba, SAFETY_INTENT_CATEGORIES[0], 0, "unsafe", "baseline")
+        inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.device)
+
+        d_model = self.model.config.hidden_size
+        awakener = SafetyAwakener(self.model, self.layers, layer_idx=8, device=self.device, d_model=d_model, mutation_scale=5.0, max_norm=5.0)
+        aw_res = awakener.optimize(inputs=inputs, refusal_ids=refusal_ids, steps=6, lr=0.1, l1_lambda=1e-4, l2_lambda=1e-4, topk=5)
+
+        ctrl = AdaptiveSteeringRLController(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            layers=self.layers,
+            device=self.device,
+            policy_type="bandit",
+            candidate_layers=self.target_layers,
+            candidate_magnitudes=[5.0, 12.0, 20.0],
+            exploration_c=1.25,
+        )
+        rl_res = ctrl.steer_and_evaluate(
+            prompt_text=prompt_text,
+            inputs=inputs,
+            refusal_ids=refusal_ids,
+            language_name="Yoruba",
+            prompt_kind="unsafe",
+            scaffold_name="baseline",
+            awakening_results=[aw_res],
+            best_awakening=aw_res,
+        )
+        self.assertEqual(rl_res.chosen_action.name, "L8_mag5.0_full",
+                         f"Bandit must select L8_mag5.0_full over mag12.0/20.0, but got {rl_res.chosen_action.name}")
+        self.assertAlmostEqual(rl_res.refusal_gain, aw_res.safety_awakening_gain, delta=0.002)
+        self.assertTrue(rl_res.reward_breakdown.is_safe)
+        self.assertFalse(rl_res.was_rolled_back)
+
+    def test_unsafe_rollback_restores_verified_gain(self):
+        """
+        Verifies that if an intervention degrades refusal on an unsafe prompt,
+        the controller triggers rollback and safely restores the Part B verified intervention.
+        """
+        yoruba = next(l for l in LANGUAGES if l["name"] == "Yoruba")
+        refusal_starts = yoruba["refusal_starts"] + yoruba["safe_starts"]
+        refusal_ids, _, _ = token_ids_for_starts(self.tokenizer, refusal_starts)
+
+        prompt_text = build_prompt(yoruba, SAFETY_INTENT_CATEGORIES[0], 0, "unsafe", "baseline")
+        inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.device)
+
+        d_model = self.model.config.hidden_size
+        awakener = SafetyAwakener(self.model, self.layers, layer_idx=8, device=self.device, d_model=d_model, mutation_scale=5.0, max_norm=5.0)
+        aw_res = awakener.optimize(inputs=inputs, refusal_ids=refusal_ids, steps=6, lr=0.1, l1_lambda=1e-4, l2_lambda=1e-4, topk=5)
+
+        ctrl = AdaptiveSteeringRLController(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            layers=self.layers,
+            device=self.device,
+            policy_type="bandit",
+            candidate_layers=self.target_layers,
+            candidate_magnitudes=[5.0, 12.0, 20.0],
+            exploration_c=1.25,
+        )
+
+        # Force an action with negative magnitude that opposes the refusal direction (causing refusal drop)
+        forced_act = SteeringAction(action_id=99, name="L8_mag_neg12.0_degrading", layer_idx=8, magnitude=-12.0, is_no_op=False)
+        rl_res = ctrl.steer_and_evaluate(
+            prompt_text=prompt_text,
+            inputs=inputs,
+            refusal_ids=refusal_ids,
+            language_name="Yoruba",
+            prompt_kind="unsafe",
+            scaffold_name="baseline",
+            awakening_results=[aw_res],
+            best_awakening=aw_res,
+            forced_action=forced_act,
+        )
+        self.assertTrue(rl_res.was_rolled_back, "Refusal-degrading action on unsafe prompt must trigger rollback.")
+        self.assertFalse(rl_res.reward_breakdown.is_safe, "Degraded action must fail safety gate.")
+        self.assertLess(rl_res.reward_breakdown.total_reward, -0.99, "Degraded action must receive <= -1.0 penalty.")
+        self.assertAlmostEqual(rl_res.refusal_gain, aw_res.safety_awakening_gain, delta=0.002,
+                               msg="Rollback must restore the verified Part B intervention gain.")
+        self.assertIn("PartB_Verified_L8", rl_res.chosen_action.name,
+                      f"Effective chosen action must reflect Part B verified replacement, got {rl_res.chosen_action.name}")
+
 
 if __name__ == "__main__":
     unittest.main()

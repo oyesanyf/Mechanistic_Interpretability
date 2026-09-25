@@ -47,6 +47,17 @@ class ContrastiveSteeringManager:
         self.num_heads = self._find_num_heads()
         self.head_dim = self.d_model // self.num_heads if self.num_heads > 0 else 64
         self.cached_directions: Dict[int, SteeringVector] = {}
+        self.calibrated_directions: Dict[int, SteeringVector] = {}
+        self.prompt_awakening_vectors: Dict[int, SteeringVector] = {}
+
+    def clear_prompt_awakening_vectors(self) -> None:
+        """Clears per-prompt awakening vectors discovered in Part B and restores calibrated contrastive vectors."""
+        self.prompt_awakening_vectors.clear()
+        for l_idx in list(self.cached_directions.keys()):
+            if l_idx in self.calibrated_directions:
+                self.cached_directions[l_idx] = self.calibrated_directions[l_idx]
+            else:
+                self.cached_directions.pop(l_idx, None)
 
     def _find_d_model(self) -> int:
         for attr in ("hidden_size", "d_model", "n_embd"):
@@ -182,6 +193,7 @@ class ContrastiveSteeringManager:
                 )
                 vectors[l_idx] = vec
                 self.cached_directions[l_idx] = vec
+                self.calibrated_directions[l_idx] = vec
 
         return vectors
 
@@ -213,6 +225,10 @@ class ContrastiveSteeringManager:
             num_harmful_samples=1,
             language=language,
         )
+        # If this layer already had a cached/calibrated direction, preserve it in calibrated_directions
+        if layer_idx in self.cached_directions and layer_idx not in self.calibrated_directions:
+            self.calibrated_directions[layer_idx] = self.cached_directions[layer_idx]
+        self.prompt_awakening_vectors[layer_idx] = sv
         self.cached_directions[layer_idx] = sv
         logger.info(f"Registered Part B awakening direction at layer {layer_idx} (norm={norm:.4f}, gain={gain:+.6f}, lang={language})")
         return sv
@@ -224,6 +240,7 @@ class ContrastiveSteeringManager:
         magnitude: float,
         unit_direction: Optional[torch.Tensor] = None,
         head_indices: Optional[List[int]] = None,
+        is_verified_intervention: bool = False,
     ):
         """
         PyTorch forward hook intervention:
@@ -236,20 +253,35 @@ class ContrastiveSteeringManager:
             return
 
         if unit_direction is None:
-            if layer_idx not in self.cached_directions:
-                raise ValueError(f"No steering vector available for layer {layer_idx}.")
-            unit_dir = self.cached_directions[layer_idx].unit_vector
+            # 1. If executing the verified intervention from Part B:
+            if is_verified_intervention and layer_idx in self.prompt_awakening_vectors:
+                sv = self.prompt_awakening_vectors[layer_idx]
+                steering_delta = sv.raw_vector
+            elif layer_idx in self.prompt_awakening_vectors and abs(magnitude - self.prompt_awakening_vectors[layer_idx].vector_norm) <= max(1.0, 0.25 * self.prompt_awakening_vectors[layer_idx].vector_norm):
+                # Matched discrete arm bin for prompt awakening vector
+                sv = self.prompt_awakening_vectors[layer_idx]
+                steering_delta = sv.raw_vector
+            else:
+                # 2. General contrastive steering arm:
+                # Use calibrated contrastive direction if available; fallback to prompt awakening or cached vector
+                sv = self.calibrated_directions.get(layer_idx) or self.prompt_awakening_vectors.get(layer_idx) or self.cached_directions.get(layer_idx)
+                if sv is None:
+                    raise ValueError(f"No steering vector available for layer {layer_idx}.")
+                unit_dir = sv.unit_vector.to(self.device).float()
+                u_norm = torch.norm(unit_dir).item()
+                if u_norm < 1e-6:
+                    logger.warning(f"Steering direction for layer {layer_idx} has zero norm; intervention will be a no-op.")
+                    yield
+                    return
+                steering_delta = magnitude * unit_dir
         else:
-            unit_dir = unit_direction
-
-        unit_dir = unit_dir.to(self.device).float()
-        u_norm = torch.norm(unit_dir).item()
-        if u_norm < 1e-6:
-            logger.warning(f"Steering direction for layer {layer_idx} has zero norm; intervention will be a no-op.")
-            yield
-            return
-
-        steering_delta = magnitude * unit_dir
+            unit_dir = unit_direction.to(self.device).float()
+            u_norm = torch.norm(unit_dir).item()
+            if u_norm < 1e-6:
+                logger.warning(f"Steering direction for layer {layer_idx} has zero norm; intervention will be a no-op.")
+                yield
+                return
+            steering_delta = magnitude * unit_dir
 
         if head_indices is None or len(head_indices) == 0:
             # Full residual stream hook at layer output

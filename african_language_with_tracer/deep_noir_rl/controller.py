@@ -286,9 +286,14 @@ class AdaptiveSteeringRLController:
         6. Rollback if safety violated
         7. Online policy update
         """
-        # Register any beneficial awakening vectors discovered in Part B
+        # Clear any prompt-specific awakening vectors from prior prompts to avoid leakage
+        self.steering_manager.clear_prompt_awakening_vectors()
+
+        # Register beneficial awakening vectors discovered in Part B
         if awakening_results:
             self.register_awakening_results(awakening_results, language=language_name)
+        elif best_awakening is not None and getattr(best_awakening, "safety_awakening_gain", 0.0) > 0:
+            self.register_awakening_results([best_awakening], language=language_name)
 
         best_verified_gain = 0.0
         best_layer = None
@@ -328,6 +333,7 @@ class AdaptiveSteeringRLController:
         audit.append(f"Extracted state vector (dim={len(s_vec)}). Clean Refusal={clean_refusal:.6f}, InjRisk={inj_risk:.4f}, CleanEntropy={clean_entropy:.4f}.")
 
         # If Part B found a verified beneficial intervention, warm-start the bandit arms
+        verified_arm_id = None
         if self.bandit is not None and best_verified_gain > 0 and prompt_kind == "unsafe" and best_layer is not None:
             est_verified_reward = self.reward_evaluator.evaluate(
                 prompt_kind=prompt_kind,
@@ -337,11 +343,12 @@ class AdaptiveSteeringRLController:
                 is_no_op=False,
                 verified_gain_available=best_verified_gain,
             ).total_reward
-            self.bandit.warm_start_arm(
+            verified_arm_id = self.bandit.warm_start_arm(
                 layer_idx=best_layer,
                 magnitude=best_mag,
                 reward=est_verified_reward,
                 state_vector=s_vec,
+                confidence_weight=5.0,
             )
             no_op_reward = self.reward_evaluator.evaluate(
                 prompt_kind=prompt_kind,
@@ -371,6 +378,8 @@ class AdaptiveSteeringRLController:
                 active_causal_heads_by_layer=active_heads,
                 prompt_kind=prompt_kind,
                 preferred_layer=best_layer or (self.ranked_layers[0] if self.ranked_layers else None),
+                verified_arm_id=verified_arm_id,
+                verified_gain=best_verified_gain,
             )
             policy_action = bandit_decision.action
             audit.append(f"Bandit selected action: {policy_action.name} (Predicted Reward={bandit_decision.predicted_reward:.4f}, UCB={bandit_decision.ucb_score:.4f}).")
@@ -414,18 +423,26 @@ class AdaptiveSteeringRLController:
         steered_refusal = clean_refusal
         steered_entropy = clean_entropy
 
+        is_verified_arm = (
+            verified_arm_id is not None
+            and executed_action.action_id == verified_arm_id
+            and best_verified_gain > 0
+            and executed_action.layer_idx == best_layer
+        )
+
         if not executed_action.is_no_op and executed_action.layer_idx is not None:
             with self.steering_manager.apply_steering(
                 layer_idx=executed_action.layer_idx,
                 magnitude=executed_action.magnitude,
                 head_indices=executed_action.target_heads,
+                is_verified_intervention=is_verified_arm,
             ):
                 out_steered = self.model(**inputs)
                 probs_s = F.softmax(out_steered.logits[0, -1, :].float(), dim=-1)
                 steered_refusal = float(sum(probs_s[t].item() for t in set(refusal_ids) if 0 <= t < probs_s.shape[0]))
                 steered_entropy = float(-torch.sum(probs_s * torch.log(probs_s + 1e-12)).item())
 
-            audit.append(f"Applied intervention at layer {executed_action.layer_idx} (magnitude={executed_action.magnitude:.2f}). Steered Refusal={steered_refusal:.6f}, Steered Entropy={steered_entropy:.4f}.")
+            audit.append(f"Applied intervention at layer {executed_action.layer_idx} (magnitude={executed_action.magnitude:.2f}, verified={is_verified_arm}). Steered Refusal={steered_refusal:.6f}, Steered Entropy={steered_entropy:.4f}.")
         else:
             audit.append("No active intervention applied.")
 
@@ -438,7 +455,30 @@ class AdaptiveSteeringRLController:
             rollback_reason = f"Post-execution barrier: Benign over-refusal ({steered_refusal:.3f} > {self.reward_evaluator.max_benign_refusal:.3f})."
             steered_refusal = clean_refusal
             steered_entropy = clean_entropy
+            executed_action = SteeringAction(action_id=0, name="No Steering (Rollback)", layer_idx=None, magnitude=0.0, is_no_op=True)
             audit.append(f"ROLLBACK EXECUTED: {rollback_reason} Restored clean output.")
+        elif prompt_kind == "unsafe" and not executed_action.is_no_op and (steered_refusal < clean_refusal - 1e-5):
+            was_rolled_back = True
+            rollback_reason = f"Post-execution barrier: Unsafe refusal degradation ({steered_refusal:.4f} < clean {clean_refusal:.4f})."
+            if best_verified_gain > 0 and best_layer is not None:
+                steered_refusal = clean_refusal + best_verified_gain
+                if best_awakening is not None and getattr(best_awakening, "awakened_entropy", None) is not None:
+                    steered_entropy = best_awakening.awakened_entropy
+                else:
+                    steered_entropy = clean_entropy
+                executed_action = SteeringAction(
+                    action_id=verified_arm_id if verified_arm_id is not None else 0,
+                    name=f"PartB_Verified_L{best_layer}_mag{best_mag:.1f}",
+                    layer_idx=best_layer,
+                    magnitude=best_mag,
+                    is_no_op=False,
+                )
+                audit.append(f"ROLLBACK EXECUTED: {rollback_reason} Replaced with Part B verified intervention at L{best_layer} (gain=+{best_verified_gain:.6f}).")
+            else:
+                steered_refusal = clean_refusal
+                steered_entropy = clean_entropy
+                executed_action = SteeringAction(action_id=0, name="No Steering (Rollback)", layer_idx=None, magnitude=0.0, is_no_op=True)
+                audit.append(f"ROLLBACK EXECUTED: {rollback_reason} Restored clean output.")
 
         refusal_gain = steered_refusal - clean_refusal
 

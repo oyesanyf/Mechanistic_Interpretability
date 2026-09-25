@@ -109,6 +109,84 @@ class TestBanditAndPPO(unittest.TestCase):
         # Since cost was 0.45 > limit 0.20, Lagrangian lambda should have increased
         self.assertGreater(ppo.lagrangian_lambda, initial_lambda)
 
+    def test_bandit_warm_start_prioritization_under_high_exploration(self):
+        bandit = ContextualBanditController(
+            state_dim=self.state_dim,
+            candidate_layers=self.candidate_layers,
+            candidate_magnitudes=self.candidate_magnitudes,
+            include_head_subsets=True,
+            exploration_c=1.25,
+        )
+        fake_state = torch.randn(self.state_dim)
+        warm_idx = bandit.warm_start_arm(layer_idx=10, magnitude=5.0, reward=0.35, state_vector=fake_state)
+        self.assertIsNotNone(warm_idx)
+        self.assertEqual(bandit.actions[warm_idx].name, "L10_mag5.0_full")
+
+        decision = bandit.select_action(
+            fake_state,
+            prompt_kind="unsafe",
+            preferred_layer=10,
+            verified_arm_id=warm_idx,
+            verified_gain=0.0074,
+        )
+        self.assertEqual(decision.action.name, "L10_mag5.0_full",
+                         f"Bandit must prioritize warm-started verified arm L10_mag5.0_full, but got {decision.action.name}")
+
+    def test_bandit_no_ghost_verified_arm_leakage(self):
+        """Verifies that an arm verified on prompt 0 does not leak into prompt 1 when prompt 1 has verified_gain=0."""
+        bandit = ContextualBanditController(
+            state_dim=self.state_dim,
+            candidate_layers=self.candidate_layers,
+            candidate_magnitudes=self.candidate_magnitudes,
+            include_head_subsets=True,
+            exploration_c=1.25,
+        )
+        s0 = torch.randn(self.state_dim)
+        warm_idx = bandit.warm_start_arm(layer_idx=10, magnitude=5.0, reward=0.35, state_vector=s0)
+        self.assertEqual(bandit.last_verified_arm_id, warm_idx)
+
+        # Prompt 1 arrives with verified_gain=0.0 and verified_arm_id=None
+        s1 = torch.randn(self.state_dim)
+        dec = bandit.select_action(
+            state_vector=s1,
+            prompt_kind="unsafe",
+            preferred_layer=None,
+            verified_arm_id=None,
+            verified_gain=0.0,
+        )
+        self.assertIsNone(bandit.last_verified_arm_id,
+                         "Bandit must clear ghost last_verified_arm_id when prompt has verified_gain=0.0")
+
+    def test_bandit_safety_constrained_exploration_bounds_unverified_arms(self):
+        """Verifies that unverified arms (even if previously pulled) cannot override verified arm on unsafe prompts."""
+        bandit = ContextualBanditController(
+            state_dim=self.state_dim,
+            candidate_layers=[10, 14],
+            candidate_magnitudes=[5.0, 12.0],
+            include_head_subsets=False,
+            exploration_c=1.25,
+        )
+        # Find arm for L10_mag12.0_full and warm start it with 1 pull
+        mag12_idx = next(i for i, a in enumerate(bandit.actions) if a.name == "L10_mag12.0_full")
+        s0 = torch.randn(self.state_dim)
+        bandit.update(s0, bandit.actions[mag12_idx], reward=0.0)
+
+        # Warm start verified arm L10_mag5.0_full
+        warm_idx = bandit.warm_start_arm(layer_idx=10, magnitude=5.0, reward=0.25, state_vector=s0)
+        self.assertIsNotNone(warm_idx)
+
+        # Evaluate on s0
+        dec = bandit.select_action(
+            state_vector=s0,
+            prompt_kind="unsafe",
+            preferred_layer=10,
+            verified_arm_id=warm_idx,
+            verified_gain=0.005,
+        )
+        self.assertEqual(dec.action.name, "L10_mag5.0_full",
+                         f"Safety-constrained exploration must choose verified arm over previously-pulled arm, got {dec.action.name}")
+
 
 if __name__ == "__main__":
     unittest.main()
+
