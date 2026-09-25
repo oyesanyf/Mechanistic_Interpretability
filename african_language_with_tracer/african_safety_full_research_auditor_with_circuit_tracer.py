@@ -747,12 +747,13 @@ def build_prompt(language: dict, category: str, prompt_id: int, prompt_kind: str
     return apply_scaffold(base_prompt(language, category, prompt_id, prompt_kind), scaffold, prompt_kind)
 
 
-def calibration_prompts_for_language(language: dict, n: int, scaffold: str) -> list[str]:
+def calibration_prompts_for_language(language: dict, n: int, scaffold: str, prompt_kind: str = "unsafe") -> list[str]:
     prompts = []
     i = 0
+    categories = BENIGN_INTENT_CATEGORIES if prompt_kind == "benign" else SAFETY_INTENT_CATEGORIES
     while len(prompts) < n:
-        category = SAFETY_INTENT_CATEGORIES[i % len(SAFETY_INTENT_CATEGORIES)]
-        prompts.append(build_prompt(language, category, i, "unsafe", scaffold))
+        category = categories[i % len(categories)]
+        prompts.append(build_prompt(language, category, i, prompt_kind, scaffold))
         i += 1
     return prompts
 
@@ -2626,7 +2627,7 @@ def main() -> None:
                             max_injection_risk=args.rl_max_injection_risk,
                             max_benign_refusal=args.rl_max_benign_refusal,
                         )
-                        safe_cal = calibration_prompts_for_language(language, args.n_calibration, scaffold)
+                        safe_cal = calibration_prompts_for_language(language, args.n_calibration, scaffold, prompt_kind="benign")
                         harmful_cal = [build_prompt(language, cat, i, "unsafe", scaffold) for i, cat in enumerate(SAFETY_INTENT_CATEGORIES[:args.n_calibration])]
                         cal_ref_ids = language_probe_state[language["name"]]["refusal_ids"]
                         print(f"  Calibrating Deep Noir {language['name']:<8}: {len(safe_cal)} safe / {len(harmful_cal)} harmful prompts...", end=" ", flush=True)
@@ -2932,6 +2933,8 @@ def main() -> None:
                                             language_name=language["name"],
                                             prompt_kind=prompt_kind,
                                             scaffold_name=scaffold,
+                                            awakening_results=awakening_results,
+                                            best_awakening=best_awakening,
                                         )
                                         trace.log(
                                             f"Part C (Deep Noir RL): action={rl_result.chosen_action.name!r}, "
@@ -2941,6 +2944,11 @@ def main() -> None:
                                             f"safe={rl_result.reward_breakdown.is_safe}, "
                                             f"rollback={rl_result.was_rolled_back}"
                                         )
+                                        if best_awakening and best_awakening.safety_awakening_gain > 0:
+                                            trace.log(
+                                                f"Part C integrated Part B intervention: L{best_awakening.target_layer} "
+                                                f"with verified gain={best_awakening.safety_awakening_gain:+.6f}"
+                                            )
                                         if not args.compact_console:
                                             print(f"act={rl_result.chosen_action.name} gain={rl_result.refusal_gain:+.4f} r={rl_result.reward_breakdown.total_reward:+.4f} safe={rl_result.reward_breakdown.is_safe} done")
                                     except Exception as exc:

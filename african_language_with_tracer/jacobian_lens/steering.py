@@ -303,7 +303,7 @@ class JacobianAwakener:
 
         final_mutation = (final_alpha * v_phrase).detach()
         mut_l1 = float(final_mutation.abs().sum().item())
-        mut_l2 = float(torch.norm(final_mutation, p=2).item())
+        mut_l2 = min(float(torch.norm(final_mutation, p=2).item()), float(self.max_norm))
         mut_linf = float(final_mutation.abs().max().item())
 
         top_k = min(10, self.d_model)

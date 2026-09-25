@@ -120,20 +120,57 @@ class ContrastiveSteeringManager:
         layer_indices: List[int],
         language: Optional[str] = None,
         batch_size: int = 8,
+        refusal_ids: Optional[List[int]] = None,
     ) -> Dict[int, SteeringVector]:
         """
         Computes contrastive steering directions:
-            v_l = mean(h_safe) - mean(h_harmful)
+            v_l = mean(h_safe) - mean(h_harmful) (oriented towards refusal).
         """
         safe_acts = self.extract_activations(safe_prompts, layer_indices, batch_size)
         harmful_acts = self.extract_activations(harmful_prompts, layer_indices, batch_size)
+
+        sample_inp = None
+        p_clean_sample = None
+        if refusal_ids and harmful_prompts:
+            try:
+                sample_inp = self.tokenizer(harmful_prompts[0], return_tensors="pt").to(self.device)
+                with torch.no_grad():
+                    out_c = self.model(**sample_inp)
+                    p_clean_sample = sum(
+                        F.softmax(out_c.logits[0, -1, :].float(), dim=-1)[t].item()
+                        for t in set(refusal_ids) if 0 <= t < out_c.logits.shape[-1]
+                    )
+            except Exception as exc:
+                logger.debug(f"Could not compute baseline sample probe for orientation: {exc}")
 
         vectors: Dict[int, SteeringVector] = {}
         for l_idx in layer_indices:
             if l_idx in safe_acts and l_idx in harmful_acts:
                 raw_diff = safe_acts[l_idx] - harmful_acts[l_idx]
                 norm = torch.norm(raw_diff).item()
-                unit_vec = raw_diff / (norm + 1e-9)
+                if norm <= 1e-6:
+                    logger.warning(f"Contrastive steering vector for layer {l_idx} has near-zero norm ({norm:.6f}). Prompts may be identical or produce identical activations.")
+                    unit_vec = torch.zeros_like(raw_diff)
+                else:
+                    unit_vec = raw_diff / norm
+                    # Verify vector orientation towards refusal
+                    if sample_inp is not None and p_clean_sample is not None and refusal_ids:
+                        try:
+                            with self.apply_steering(l_idx, magnitude=5.0, unit_direction=unit_vec):
+                                with torch.no_grad():
+                                    out_s = self.model(**sample_inp)
+                                    p_s = sum(
+                                        F.softmax(out_s.logits[0, -1, :].float(), dim=-1)[t].item()
+                                        for t in set(refusal_ids) if 0 <= t < out_s.logits.shape[-1]
+                                    )
+                            if p_s < p_clean_sample:
+                                # Reverse vector so positive steering increases refusal
+                                raw_diff = -raw_diff
+                                unit_vec = -unit_vec
+                                logger.info(f"Layer {l_idx}: Inverted contrastive vector orientation to align with refusal (+gain={p_clean_sample - p_s:+.6f}).")
+                        except Exception as exc:
+                            logger.debug(f"Orientation probe check fallback at layer {l_idx}: {exc}")
+
                 vec = SteeringVector(
                     layer_idx=l_idx,
                     raw_vector=raw_diff,
@@ -147,6 +184,38 @@ class ContrastiveSteeringManager:
                 self.cached_directions[l_idx] = vec
 
         return vectors
+
+    def register_awakening_direction(
+        self,
+        layer_idx: int,
+        vector: torch.Tensor,
+        gain: float = 0.0,
+        language: Optional[str] = None,
+    ) -> SteeringVector:
+        """
+        Registers an awakening direction discovered in Part B into the steering manager.
+        Normalizes the vector into a unit steering vector while storing raw vector and norm.
+        """
+        vec = vector.detach().to(self.device).float()
+        norm = torch.norm(vec).item()
+        if norm > 1e-6:
+            unit_vec = vec / norm
+        else:
+            unit_vec = torch.zeros_like(vec)
+            logger.warning(f"Registered awakening vector for layer {layer_idx} has near-zero norm ({norm:.6f}).")
+
+        sv = SteeringVector(
+            layer_idx=layer_idx,
+            raw_vector=vec,
+            unit_vector=unit_vec,
+            vector_norm=norm,
+            num_safe_samples=1,
+            num_harmful_samples=1,
+            language=language,
+        )
+        self.cached_directions[layer_idx] = sv
+        logger.info(f"Registered Part B awakening direction at layer {layer_idx} (norm={norm:.4f}, gain={gain:+.6f}, lang={language})")
+        return sv
 
     @contextmanager
     def apply_steering(
@@ -174,6 +243,12 @@ class ContrastiveSteeringManager:
             unit_dir = unit_direction
 
         unit_dir = unit_dir.to(self.device).float()
+        u_norm = torch.norm(unit_dir).item()
+        if u_norm < 1e-6:
+            logger.warning(f"Steering direction for layer {layer_idx} has zero norm; intervention will be a no-op.")
+            yield
+            return
+
         steering_delta = magnitude * unit_dir
 
         if head_indices is None or len(head_indices) == 0:

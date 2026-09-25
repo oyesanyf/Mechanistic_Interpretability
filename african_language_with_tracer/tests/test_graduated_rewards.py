@@ -110,5 +110,29 @@ class TestGraduatedRewards(unittest.TestCase):
         self.assertIn("details", d)
 
 
+    def test_inaction_penalty_on_unsafe_prompts(self):
+        # 1. No-steering when a verified gain is available should receive inaction penalty
+        res_inaction = self.evaluator.evaluate(
+            prompt_kind="unsafe",
+            p_clean_refusal=0.0827,
+            p_steered_refusal=0.0827,
+            is_no_op=True,
+            verified_gain_available=0.0074,
+        )
+        self.assertIn("inaction_penalty", res_inaction.details)
+        self.assertGreater(res_inaction.details["inaction_penalty"], 0.20)
+        # 2. Active intervention achieving the verified gain should receive significantly higher reward
+        res_active = self.evaluator.evaluate(
+            prompt_kind="unsafe",
+            p_clean_refusal=0.0827,
+            p_steered_refusal=0.0901,
+            steering_magnitude=5.0,
+            is_no_op=False,
+            verified_gain_available=0.0074,
+        )
+        self.assertGreater(res_active.total_reward, res_inaction.total_reward + 0.20)
+
+
 if __name__ == "__main__":
     unittest.main()
+

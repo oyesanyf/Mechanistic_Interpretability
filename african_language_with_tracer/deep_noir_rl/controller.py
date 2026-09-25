@@ -159,6 +159,7 @@ class AdaptiveSteeringRLController:
             harmful_prompts=harmful_prompts,
             layer_indices=self.candidate_layers,
             language=language,
+            refusal_ids=refusal_ids,
         )
 
         if not run_full_deep_noir or not harmful_prompts:
@@ -242,6 +243,26 @@ class AdaptiveSteeringRLController:
         """Backward-compatible wrapper for full Deep Noir calibration."""
         return self.calibrate(safe_prompts, harmful_prompts, refusal_ids=refusal_ids, language=language)
 
+    def register_awakening_results(
+        self,
+        awakening_results: List[Any],
+        language: Optional[str] = None,
+    ) -> None:
+        """
+        Registers beneficial interventions discovered in Part B into the steering manager.
+        """
+        for aw in awakening_results:
+            vec = getattr(aw, "mutation_vector", None)
+            gain = getattr(aw, "safety_awakening_gain", 0.0)
+            target_layer = getattr(aw, "target_layer", None)
+            if vec is not None and target_layer is not None and gain > 0:
+                self.steering_manager.register_awakening_direction(
+                    layer_idx=target_layer,
+                    vector=vec,
+                    gain=gain,
+                    language=language,
+                )
+
     def steer_and_evaluate(
         self,
         prompt_text: str,
@@ -251,19 +272,44 @@ class AdaptiveSteeringRLController:
         prompt_kind: str,
         scaffold_name: str = "baseline",
         update_policy: bool = True,
+        awakening_results: Optional[List[Any]] = None,
+        best_awakening: Optional[Any] = None,
+        forced_action: Optional[SteeringAction] = None,
     ) -> AdaptiveSteeringResult:
         """
         Executes full adaptive steering cycle for an individual prompt:
         1. State extraction
-        2. Action selection via RL policy
+        2. Action selection via RL policy (or forced_action bypass)
         3. Hard safety gate pre-check
         4. Intervention application
         5. Forward pass and reward computation
         6. Rollback if safety violated
         7. Online policy update
         """
+        # Register any beneficial awakening vectors discovered in Part B
+        if awakening_results:
+            self.register_awakening_results(awakening_results, language=language_name)
+
+        best_verified_gain = 0.0
+        best_layer = None
+        best_mag = 5.0
+
+        if best_awakening is not None:
+            best_verified_gain = max(0.0, getattr(best_awakening, "safety_awakening_gain", 0.0))
+            best_layer = getattr(best_awakening, "target_layer", None)
+            best_mag = getattr(best_awakening, "mutation_l2", 5.0)
+        elif awakening_results:
+            best_verified_gain = max(0.0, max((getattr(a, "safety_awakening_gain", 0.0) for a in awakening_results), default=0.0))
+            for a in awakening_results:
+                if getattr(a, "safety_awakening_gain", 0.0) == best_verified_gain:
+                    best_layer = getattr(a, "target_layer", None)
+                    best_mag = getattr(a, "mutation_l2", 5.0)
+                    break
+
         audit: List[str] = []
         audit.append(f"Received prompt ({prompt_kind}) in {language_name} under scaffold {scaffold_name}.")
+        if best_verified_gain > 0:
+            audit.append(f"Part B verified gain available: +{best_verified_gain:.6f} at layer {best_layer} (mag={best_mag:.2f}).")
 
         # 1. State extraction with real Logit Lens emergence and antagonist scores
         extracted = self.state_extractor.extract_state(
@@ -281,13 +327,51 @@ class AdaptiveSteeringRLController:
         inj_risk = extracted.injection_risk
         audit.append(f"Extracted state vector (dim={len(s_vec)}). Clean Refusal={clean_refusal:.6f}, InjRisk={inj_risk:.4f}, CleanEntropy={clean_entropy:.4f}.")
 
-        # 2. Action selection via RL policy
+        # If Part B found a verified beneficial intervention, warm-start the bandit arms
+        if self.bandit is not None and best_verified_gain > 0 and prompt_kind == "unsafe" and best_layer is not None:
+            est_verified_reward = self.reward_evaluator.evaluate(
+                prompt_kind=prompt_kind,
+                p_clean_refusal=clean_refusal,
+                p_steered_refusal=clean_refusal + best_verified_gain,
+                steering_magnitude=best_mag,
+                is_no_op=False,
+                verified_gain_available=best_verified_gain,
+            ).total_reward
+            self.bandit.warm_start_arm(
+                layer_idx=best_layer,
+                magnitude=best_mag,
+                reward=est_verified_reward,
+                state_vector=s_vec,
+            )
+            no_op_reward = self.reward_evaluator.evaluate(
+                prompt_kind=prompt_kind,
+                p_clean_refusal=clean_refusal,
+                p_steered_refusal=clean_refusal,
+                is_no_op=True,
+                verified_gain_available=best_verified_gain,
+            ).total_reward
+            self.bandit.warm_start_arm(
+                layer_idx=None,
+                magnitude=0.0,
+                reward=no_op_reward,
+                state_vector=s_vec,
+            )
+
+        # 2. Action selection via RL policy (or forced_action bypass)
         ppo_decision = None
         bandit_decision = None
         active_heads = self.causal_heads_by_layer
 
-        if self.policy_type == "bandit" and self.bandit is not None:
-            bandit_decision = self.bandit.select_action(s_vec, active_causal_heads_by_layer=active_heads)
+        if forced_action is not None:
+            policy_action = forced_action
+            audit.append(f"Forced action override (diagnostic bypass): {policy_action.name}.")
+        elif self.policy_type == "bandit" and self.bandit is not None:
+            bandit_decision = self.bandit.select_action(
+                s_vec,
+                active_causal_heads_by_layer=active_heads,
+                prompt_kind=prompt_kind,
+                preferred_layer=best_layer or (self.ranked_layers[0] if self.ranked_layers else None),
+            )
             policy_action = bandit_decision.action
             audit.append(f"Bandit selected action: {policy_action.name} (Predicted Reward={bandit_decision.predicted_reward:.4f}, UCB={bandit_decision.ucb_score:.4f}).")
         elif self.policy_type == "ppo" and self.ppo is not None:
@@ -295,8 +379,12 @@ class AdaptiveSteeringRLController:
             policy_action = ppo_decision.action
             audit.append(f"PPO selected action: {policy_action.name} (Value={ppo_decision.value_estimate:.4f}, CostEst={ppo_decision.cost_estimate:.4f}).")
         elif self.policy_type in ("static", "deep_noir_classic"):
-            static_mag = self.best_static_magnitude
-            static_layer = self.best_static_layer or (self.candidate_layers[0] if self.candidate_layers else 0)
+            if best_verified_gain > 0 and best_layer is not None:
+                static_mag = best_mag
+                static_layer = best_layer
+            else:
+                static_mag = self.best_static_magnitude
+                static_layer = self.best_static_layer or (self.candidate_layers[0] if self.candidate_layers else 0)
             static_heads = self.causal_heads_by_layer.get(static_layer)
             policy_action = SteeringAction(
                 action_id=999,
@@ -369,6 +457,8 @@ class AdaptiveSteeringRLController:
             was_rolled_back=was_rolled_back,
             rollback_reason=rollback_reason,
             extra_details={"action_name": policy_action.name, "language": language_name, "was_rolled_back": was_rolled_back},
+            is_no_op=policy_action.is_no_op,
+            verified_gain_available=best_verified_gain,
         )
         audit.append(f"Reward evaluated: Total={reward_breakdown.total_reward:+.4f} (Acc={reward_breakdown.s_acc:.4f}, InjPenalty={reward_breakdown.s_inj:.4f}, CapPreserv={reward_breakdown.s_cap:.4f}, CostPenalty={reward_breakdown.s_cost:.4f}, Safe={reward_breakdown.is_safe}).")
 
