@@ -18,7 +18,7 @@ Modules:
 from .hardware_profiler import HardwareProfiler, HardwareProfile, HardwareTier
 from .graduated_rewards import GraduatedRewardEvaluator, GraduatedRewardBreakdown
 from .logit_lens import LogitLensAnalyzer, LogitLensLayerRecord, AntagonistHeadScore, DeepNoirLayerRanking
-from .gradient_attribution import CausalGradientAttributor, HeadAttributionScore
+from .gradient_attribution import CausalGradientAttributor, GradientActivationAttributor, HeadAttributionScore, ValidatedHeadAttribution
 from .contrastive_steering import ContrastiveSteeringManager, SteeringVector
 from .golden_section_search import DeepNoirGoldenSectionSearcher, GoldenSectionSearchResult
 from .state_extractor import RLStateExtractor, ExtractedState
@@ -38,7 +38,9 @@ __all__ = [
     "AntagonistHeadScore",
     "DeepNoirLayerRanking",
     "CausalGradientAttributor",
+    "GradientActivationAttributor",
     "HeadAttributionScore",
+    "ValidatedHeadAttribution",
     "ContrastiveSteeringManager",
     "SteeringVector",
     "DeepNoirGoldenSectionSearcher",

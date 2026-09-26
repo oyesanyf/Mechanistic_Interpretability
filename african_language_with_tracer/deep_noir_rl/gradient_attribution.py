@@ -33,8 +33,28 @@ class HeadAttributionScore:
     activation_norm: float
 
 
-class CausalGradientAttributor:
-    """Computes causal gradient attribution for attention heads."""
+@dataclass
+class ValidatedHeadAttribution:
+    layer_idx: int
+    head_idx: int
+    delta: float
+    is_causal: bool
+    baseline_metric: float
+    ablated_metric: float
+
+    @property
+    def is_causally_implicated(self) -> bool:
+        return self.is_causal
+
+    def __iter__(self):
+        return iter((self.layer_idx, self.head_idx, self.delta, self.is_causal))
+
+    def __getitem__(self, idx):
+        return (self.layer_idx, self.head_idx, self.delta, self.is_causal)[idx]
+
+
+class GradientActivationAttributor:
+    """Computes gradient-activation attribution for attention heads with causal intervention validation."""
 
     def __init__(self, model, layers, device: Optional[str] = None):
         self.model = model
@@ -215,7 +235,7 @@ class CausalGradientAttributor:
             if attn_mod is None:
                 continue
 
-            for h_idx in range(min(self.num_heads, 4)):  # Sample first few heads
+            for h_idx in range(self.num_heads):  # Search across all attention heads (Requirement 14)
                 start = h_idx * self.head_dim
                 end = start + self.head_dim
 
@@ -243,3 +263,97 @@ class CausalGradientAttributor:
 
         head_scores.sort(key=lambda s: s.attribution_score, reverse=True)
         return head_scores[:top_k]
+
+    @torch.no_grad()
+    def validate_heads_with_intervention(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        refusal_ids: List[int],
+        candidate_heads: List[Any],
+        threshold: float = 0.005,
+    ) -> List[ValidatedHeadAttribution]:
+        """
+        Validates whether candidate attention heads are causally implicated in refusal
+        by performing targeted ablation/patching and checking if the metric change >= threshold (default 0.005).
+        """
+        if not candidate_heads or not refusal_ids:
+            return []
+
+        out_clean = self.model(**inputs)
+        probs_clean = F.softmax(out_clean.logits[0, -1, :].float(), dim=-1)
+        valid_ids = [t for t in set(refusal_ids) if 0 <= t < probs_clean.shape[0]]
+        if not valid_ids:
+            return []
+        baseline_metric = float(sum(probs_clean[t].item() for t in valid_ids))
+
+        validated_results: List[ValidatedHeadAttribution] = []
+
+        for cand in candidate_heads:
+            if isinstance(cand, HeadAttributionScore):
+                l_idx, h_idx = cand.layer_idx, cand.head_idx
+            elif isinstance(cand, (tuple, list)):
+                l_idx, h_idx = int(cand[0]), int(cand[1])
+            else:
+                continue
+
+            if l_idx < 0 or l_idx >= len(self.layers):
+                continue
+            if h_idx < 0 or h_idx >= self.num_heads:
+                continue
+
+            layer = self.layers[l_idx]
+            attn_mod = None
+            for attr in ("self_attn", "attention", "attn"):
+                if hasattr(layer, attr):
+                    attn_mod = getattr(layer, attr)
+                    break
+            if attn_mod is None:
+                continue
+
+            start = h_idx * self.head_dim
+            end = start + self.head_dim
+
+            out_proj = self._find_out_proj(attn_mod)
+            handle = None
+            if out_proj is not None:
+                def make_pre_hook(s, e):
+                    def pre_hook(_mod, args):
+                        h = args[0].clone()
+                        h[0, -1, s:e] = 0.0
+                        return (h,) + args[1:]
+                    return pre_hook
+                handle = out_proj.register_forward_pre_hook(make_pre_hook(start, end))
+            else:
+                def make_hook(s, e):
+                    def hook(_mod, _inp, out):
+                        h = out[0] if isinstance(out, tuple) else out
+                        patched = h.clone()
+                        patched[0, -1, s:e] = 0.0
+                        return (patched,) + out[1:] if isinstance(out, tuple) else patched
+                    return hook
+                handle = attn_mod.register_forward_hook(make_hook(start, end))
+
+            try:
+                out_ablated = self.model(**inputs)
+                probs_ablated = F.softmax(out_ablated.logits[0, -1, :].float(), dim=-1)
+                ablated_metric = float(sum(probs_ablated[t].item() for t in valid_ids))
+                delta = float(abs(baseline_metric - ablated_metric))
+                is_causal = delta >= threshold
+                validated_results.append(ValidatedHeadAttribution(
+                    layer_idx=l_idx,
+                    head_idx=h_idx,
+                    delta=delta,
+                    is_causal=is_causal,
+                    baseline_metric=baseline_metric,
+                    ablated_metric=ablated_metric,
+                ))
+            finally:
+                if handle is not None:
+                    handle.remove()
+
+        return validated_results
+
+
+# Backwards compatibility alias
+CausalGradientAttributor = GradientActivationAttributor
+

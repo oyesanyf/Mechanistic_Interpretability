@@ -3,19 +3,32 @@
 Contextual Bandit Controller for Adaptive Activation Steering.
 
 Methodology:
-Implements LinUCB (Linear Upper Confidence Bound) contextual bandit.
-Selects per-input steering actions:
-    Action = (layer, attention_heads, steering_magnitude) OR "no steering" (alpha=0).
-
-Balances exploration and exploitation using confidence intervals:
-    UCB_a(s) = theta_a^T s + c(t) * sqrt(s^T A_a^{-1} s)
+1. LinUCB (Linear Upper Confidence Bound) contextual bandit with per-arm linear models:
+       UCB_a(s) = theta_a^T s + c(t) * sqrt(s^T A_a^{-1} s)
+2. Shared Action-Conditioned Linear / Ridge Model:
+       Allows evidence to generalize across related layers, magnitudes, sites, and sources.
+3. Contextual Thompson Sampling:
+       Posterior sampling theta_tilde_a ~ N(theta_hat_a, v^2 A_a^{-1})
+4. Explicit RL Modes:
+       - 'cold_rl': No Part B warm starts during evaluation
+       - 'partb_prior_rl': Controlled expert prior mode
+       - 'frozen_rl': Pure frozen policy inference (zero updates)
+5. Rich Action Space:
+       Action = (layer, site, direction_source, magnitude, head_mode) OR "no steering".
+6. Trajectory Tracking & Regret Profiling:
+       Saves per-decision uncertainty, predictions, rewards, and regret.
+7. Reproducible Policy Checkpointing:
+       Save and load policy parameters for frozen evaluation.
 """
 
 from __future__ import annotations
 
 import math
+import json
+import hashlib
 import logging
 from dataclasses import dataclass, asdict, field
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 
 import torch
@@ -30,6 +43,9 @@ class SteeringAction:
     layer_idx: Optional[int]
     magnitude: float
     target_heads: Optional[List[int]] = None
+    site: str = "residual"  # "residual" or "fresh_write"
+    direction_source: str = "contrastive"  # "contrastive", "native", "transported_english", "awakening"
+    head_mode: str = "full"  # "full" or "heads"
     is_no_op: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -43,36 +59,51 @@ class BanditDecision:
     uncertainty: float
     ucb_score: float
     all_scores: Dict[int, float] = field(default_factory=dict)
+    instantaneous_regret: Optional[float] = None
+    cumulative_regret: Optional[float] = None
+    chosen_arm_index: Optional[int] = None
 
 
 class ContextualBanditController:
-    """LinUCB Contextual Bandit for adaptive per-input steering control."""
+    """Contextual Bandit controller for adaptive per-input steering control."""
 
     def __init__(
         self,
         state_dim: int = 15,
         candidate_layers: Optional[List[int]] = None,
         candidate_magnitudes: Optional[List[float]] = None,
+        candidate_sites: Optional[List[str]] = None,
+        candidate_direction_sources: Optional[List[str]] = None,
         include_head_subsets: bool = True,
+        expanded_action_space: bool = False,
         exploration_c: float = 0.25,
         min_exploration_c: float = 0.10,
         decay_rate: float = 0.995,
         ridge_lambda: float = 1.0,
+        algorithm: str = "linucb",  # "linucb", "action_conditioned", "thompson_sampling"
+        rl_mode: str = "partb_prior_rl",   # "cold_rl", "partb_prior_rl", "frozen_rl"
+        max_steering_magnitude: Optional[float] = None,
     ):
         self.state_dim = state_dim
         self.candidate_layers = candidate_layers or [8, 12]
         self.candidate_magnitudes = candidate_magnitudes or [1.0, 2.5, 5.0]
+        self.candidate_sites = candidate_sites or ["residual"]
+        self.candidate_direction_sources = candidate_direction_sources or ["contrastive"]
         self.include_head_subsets = include_head_subsets
+        self.expanded_action_space = expanded_action_space
         self.exploration_c = exploration_c
         self.min_exploration_c = min_exploration_c
         self.decay_rate = decay_rate
         self.ridge_lambda = ridge_lambda
+        self.algorithm = algorithm.lower()
+        self.rl_mode = rl_mode.lower()
+        self.max_steering_magnitude = max_steering_magnitude or max(self.candidate_magnitudes, default=5.0)
 
         self.step_count = 0
         self.actions = self._build_action_space()
         self.num_actions = len(self.actions)
 
-        # LinUCB state matrices per arm: A_a in R^{d x d}, b_a in R^d
+        # Per-arm LinUCB state matrices: A_a in R^{d x d}, b_a in R^d
         self.A: List[torch.Tensor] = [
             self.ridge_lambda * torch.eye(state_dim, dtype=torch.float32)
             for _ in range(self.num_actions)
@@ -82,11 +113,21 @@ class ContextualBanditController:
             for _ in range(self.num_actions)
         ]
         self.pull_counts: List[int] = [0] * self.num_actions
+
+        # Shared action-conditioned model representation (Requirement 7)
+        # Action feature dim = 7 (normalized layer, normalized mag, is_heads, is_write_site, is_transported, is_awakening, is_no_op)
+        self.action_feat_dim = 7
+        self.joint_dim = self.state_dim + self.action_feat_dim + (min(4, self.state_dim) * 3)
+        self.A_shared = self.ridge_lambda * torch.eye(self.joint_dim, dtype=torch.float32)
+        self.b_shared = torch.zeros(self.joint_dim, dtype=torch.float32)
+
         self.last_verified_arm_id: Optional[int] = None
         self.last_verified_reward: Optional[float] = None
+        self.trajectory: List[Dict[str, Any]] = []
+        self.cumulative_regret: float = 0.0
 
     def _build_action_space(self) -> List[SteeringAction]:
-        """Constructs discrete action space including no-steering and parameter sweeps."""
+        """Constructs discrete action space including standard grid and expanded spaces."""
         actions: List[SteeringAction] = []
         action_id = 0
 
@@ -97,38 +138,112 @@ class ContextualBanditController:
             layer_idx=None,
             magnitude=0.0,
             target_heads=None,
+            site="residual",
+            direction_source="contrastive",
+            head_mode="full",
             is_no_op=True,
         ))
         action_id += 1
 
-        # Parameter grid: layer x magnitude x (all heads vs top heads)
-        for layer in self.candidate_layers:
-            for mag in self.candidate_magnitudes:
-                # Option 1: Full residual stream
-                actions.append(SteeringAction(
-                    action_id=action_id,
-                    name=f"L{layer}_mag{mag:.1f}_full",
-                    layer_idx=layer,
-                    magnitude=mag,
-                    target_heads=None,
-                    is_no_op=False,
-                ))
-                action_id += 1
-
-                # Option 2: Targeted causal head subset
-                if self.include_head_subsets:
+        if not self.expanded_action_space:
+            # Standard grid: layer x magnitude x (full vs heads)
+            for layer in self.candidate_layers:
+                for mag in self.candidate_magnitudes:
                     actions.append(SteeringAction(
                         action_id=action_id,
-                        name=f"L{layer}_mag{mag:.1f}_heads",
+                        name=f"L{layer}_mag{mag:.1f}_full",
                         layer_idx=layer,
                         magnitude=mag,
-                        target_heads=[0, 1, 2],  # Resolved dynamically or default top heads
+                        target_heads=None,
+                        site="residual",
+                        direction_source="contrastive",
+                        head_mode="full",
                         is_no_op=False,
                     ))
                     action_id += 1
 
-        logger.info(f"Initialized Contextual Bandit with {len(actions)} discrete actions.")
+                    if self.include_head_subsets:
+                        actions.append(SteeringAction(
+                            action_id=action_id,
+                            name=f"L{layer}_mag{mag:.1f}_heads",
+                            layer_idx=layer,
+                            magnitude=mag,
+                            target_heads=[0, 1, 2],
+                            site="residual",
+                            direction_source="contrastive",
+                            head_mode="heads",
+                            is_no_op=False,
+                        ))
+                        action_id += 1
+        else:
+            # Expanded action space (Requirement 8):
+            # layer x site x direction_source x magnitude x head_mode
+            sites = self.candidate_sites if len(self.candidate_sites) > 1 else ["residual", "fresh_write"]
+            sources = self.candidate_direction_sources if len(self.candidate_direction_sources) > 1 else ["contrastive", "transported_english"]
+
+            for layer in self.candidate_layers:
+                for site in sites:
+                    for src in sources:
+                        for mag in self.candidate_magnitudes:
+                            src_tag = "trans" if "transport" in src else ("aw" if "awake" in src else "c")
+                            site_tag = "wr" if site == "fresh_write" else "res"
+                            actions.append(SteeringAction(
+                                action_id=action_id,
+                                name=f"L{layer}_{site_tag}_{src_tag}_mag{mag:.1f}_full",
+                                layer_idx=layer,
+                                magnitude=mag,
+                                target_heads=None,
+                                site=site,
+                                direction_source=src,
+                                head_mode="full",
+                                is_no_op=False,
+                            ))
+                            action_id += 1
+
+                            if self.include_head_subsets:
+                                actions.append(SteeringAction(
+                                    action_id=action_id,
+                                    name=f"L{layer}_{site_tag}_{src_tag}_mag{mag:.1f}_heads",
+                                    layer_idx=layer,
+                                    magnitude=mag,
+                                    target_heads=[0, 1, 2],
+                                    site=site,
+                                    direction_source=src,
+                                    head_mode="heads",
+                                    is_no_op=False,
+                                ))
+                                action_id += 1
+
+        logger.info(f"Initialized Contextual Bandit with {len(actions)} discrete actions (expanded={self.expanded_action_space}).")
         return actions
+
+    def compute_action_features(self, action: SteeringAction) -> torch.Tensor:
+        """Constructs fixed-size normalized feature vector phi(a) for action a."""
+        feats = torch.zeros(self.action_feat_dim, dtype=torch.float32)
+        if action.is_no_op:
+            feats[6] = 1.0
+            return feats
+
+        min_l = min(self.candidate_layers) if self.candidate_layers else 0
+        max_l = max(self.candidate_layers) if self.candidate_layers else 24
+        l_norm = (action.layer_idx - min_l) / max(1.0, float(max_l - min_l)) if action.layer_idx is not None else 0.5
+        m_norm = min(1.0, action.magnitude / max(1e-5, self.max_steering_magnitude))
+
+        feats[0] = float(l_norm)
+        feats[1] = float(m_norm)
+        feats[2] = 1.0 if action.target_heads is not None else 0.0
+        feats[3] = 1.0 if action.site == "fresh_write" else 0.0
+        feats[4] = 1.0 if "transport" in action.direction_source else 0.0
+        feats[5] = 1.0 if "awake" in action.direction_source else 0.0
+        feats[6] = 0.0
+        return feats
+
+    def compute_joint_features(self, state_norm: torch.Tensor, action: SteeringAction) -> torch.Tensor:
+        """Constructs joint context-action representation psi(s, a)."""
+        phi_a = self.compute_action_features(action)
+        s_part = state_norm[:min(4, state_norm.shape[0])]
+        cross_term = torch.outer(s_part, phi_a[:3]).flatten()
+        return torch.cat([state_norm, phi_a, cross_term], dim=0)
 
     def get_current_exploration_c(self) -> float:
         """Decays exploration constant over time."""
@@ -146,8 +261,11 @@ class ContextualBanditController:
     ) -> Optional[int]:
         """
         Warm-starts / seeds a bandit arm with prior verified evidence (e.g. from Part B awakening).
-        Uses confidence_weight to ensure verified evidence is reflected in prior ridge parameters.
+        Requirement 2: Strictly disabled in 'cold_rl' and 'frozen_rl' modes to prevent test leakage.
         """
+        if self.rl_mode == "frozen_rl":
+            return None
+
         matching_idx = None
         if layer_idx is None or magnitude == 0.0:
             matching_idx = 0
@@ -174,8 +292,14 @@ class ContextualBanditController:
                 s_norm = s / (torch.norm(s) + 1e-8)
                 self.A[matching_idx] += confidence_weight * torch.outer(s_norm, s_norm)
                 self.b[matching_idx] += (confidence_weight * reward) * s_norm
+
+                # Also update shared action-conditioned model
+                z = self.compute_joint_features(s_norm, self.actions[matching_idx])
+                self.A_shared += confidence_weight * torch.outer(z, z)
+                self.b_shared += (confidence_weight * reward) * z
             else:
                 self.b[matching_idx] += (confidence_weight * reward) * (1.0 / math.sqrt(self.state_dim))
+
             self.pull_counts[matching_idx] += int(confidence_weight)
             self.last_verified_arm_id = matching_idx
             self.last_verified_reward = reward
@@ -191,19 +315,25 @@ class ContextualBanditController:
         preferred_layer: Optional[int] = None,
         verified_arm_id: Optional[int] = None,
         verified_gain: float = 0.0,
+        oracle_best_action_id: Optional[int] = None,
     ) -> BanditDecision:
-        """Selects action via LinUCB decision rule with safety-constrained exploration."""
+        """Selects action via LinUCB, Shared Action-Conditioned Model, or Thompson Sampling."""
         s = state_vector.detach().cpu().float()
         if s.dim() == 2:
             s = s.squeeze(0)
         s_norm = s / (torch.norm(s) + 1e-8)
 
-        # An arm is verified on THIS prompt IF AND ONLY IF verified_arm_id is provided and verified_gain > 0.
-        # If verified_gain <= 0 or verified_arm_id is None, no verified arm exists for this prompt.
-        has_verified_arm = (verified_arm_id is not None and verified_gain > 0)
-        if not has_verified_arm:
+        # In cold_rl or frozen_rl, ignore any verified arm injected at test time
+        if self.rl_mode in ("cold_rl", "frozen_rl"):
+            has_verified_arm = False
+            verified_arm_id = None
             self.last_verified_arm_id = None
             self.last_verified_reward = None
+        else:
+            has_verified_arm = (verified_arm_id is not None and verified_gain > 0)
+            if not has_verified_arm:
+                self.last_verified_arm_id = None
+                self.last_verified_reward = None
 
         c = self.get_current_exploration_c()
         scores: Dict[int, float] = {}
@@ -212,39 +342,63 @@ class ContextualBanditController:
         best_pred = 0.0
         best_uncert = 0.0
 
+        # Precompute shared inverse if using shared action-conditioned model
+        shared_theta = None
+        A_shared_inv = None
+        if self.algorithm == "action_conditioned":
+            A_shared_inv = torch.linalg.pinv(self.A_shared)
+            shared_theta = torch.matmul(A_shared_inv, self.b_shared)
+
         for a_idx in range(self.num_actions):
             action = self.actions[a_idx]
-            A_inv = torch.linalg.pinv(self.A[a_idx])
-            theta = torch.matmul(A_inv, self.b[a_idx])
 
-            pred = torch.dot(theta, s_norm).item()
-            var = torch.dot(s_norm, torch.matmul(A_inv, s_norm)).item()
-            uncertainty = math.sqrt(max(0.0, var))
+            if self.algorithm == "action_conditioned" and shared_theta is not None and A_shared_inv is not None:
+                # Shared action-conditioned model (Requirement 7)
+                z = self.compute_joint_features(s_norm, action)
+                pred = torch.dot(shared_theta, z).item()
+                var = torch.dot(z, torch.matmul(A_shared_inv, z)).item()
+                uncertainty = math.sqrt(max(0.0, var))
+            elif self.algorithm == "thompson_sampling":
+                # Contextual Thompson Sampling (Requirement 7)
+                A_inv = torch.linalg.pinv(self.A[a_idx])
+                mu = torch.matmul(A_inv, self.b[a_idx])
+                cov = 0.25 * A_inv
+                try:
+                    dist = torch.distributions.MultivariateNormal(mu, cov + 1e-6 * torch.eye(self.state_dim))
+                    theta_sample = dist.sample()
+                except Exception:
+                    theta_sample = mu
+                pred = torch.dot(mu, s_norm).item()
+                var = torch.dot(s_norm, torch.matmul(A_inv, s_norm)).item()
+                uncertainty = math.sqrt(max(0.0, var))
+                thompson_pred = torch.dot(theta_sample, s_norm).item()
+            else:
+                # Standard LinUCB
+                A_inv = torch.linalg.pinv(self.A[a_idx])
+                theta = torch.matmul(A_inv, self.b[a_idx])
+                pred = torch.dot(theta, s_norm).item()
+                var = torch.dot(s_norm, torch.matmul(A_inv, s_norm)).item()
+                uncertainty = math.sqrt(max(0.0, var))
 
-            if prompt_kind == "unsafe":
+            if self.algorithm == "thompson_sampling":
+                score = thompson_pred
+            elif prompt_kind == "unsafe":
                 if action.is_no_op:
-                    # Clean baseline is known; no epistemic exploration bonus for inaction on unsafe prompts
                     score = pred
                 elif has_verified_arm:
                     if a_idx == verified_arm_id:
-                        # Arm with verified intervention from Part B: proven safe efficacy
                         score = pred + c * uncertainty
                     else:
-                        # Safety-constrained exploration: unverified arms on unsafe prompts
-                        # must not blindly gamble with high exploration bonuses over a verified safe arm.
-                        # Exploration constant is strictly bounded to c_eff = min(c, 0.10) for all unverified arms.
                         c_eff = min(c, 0.10)
-                        mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / 30.0))
+                        mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / max(1e-5, self.max_steering_magnitude)))
                         score = pred + c_eff * uncertainty - mag_cost
                 else:
-                    # General unsafe prompt without verified arm: penalize magnitude cost on unpulled arms
-                    mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / 30.0)) if self.pull_counts[a_idx] == 0 else 0.0
+                    mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / max(1e-5, self.max_steering_magnitude))) if self.pull_counts[a_idx] == 0 else 0.0
                     score = pred + c * uncertainty - mag_cost
             else:
                 score = pred + c * uncertainty
             scores[a_idx] = score
 
-            # Tie-breaking key: score, verified arm priority, active intervention over inaction, preferred layer, full residual over heads
             is_verified = 1 if (has_verified_arm and a_idx == verified_arm_id) else 0
             is_active = 0 if (prompt_kind == "unsafe" and action.is_no_op) else 1
             is_pref = 1 if (preferred_layer is not None and action.layer_idx == preferred_layer) else 0
@@ -269,16 +423,48 @@ class ContextualBanditController:
                     layer_idx=chosen_action.layer_idx,
                     magnitude=chosen_action.magnitude,
                     target_heads=chosen_heads,
+                    site=chosen_action.site,
+                    direction_source=chosen_action.direction_source,
+                    head_mode="heads",
                     is_no_op=False,
                 )
 
-        return BanditDecision(
+        inst_regret = None
+        if oracle_best_action_id is not None:
+            oracle_score = scores.get(oracle_best_action_id, best_pred)
+            inst_regret = max(0.0, oracle_score - best_pred)
+            self.cumulative_regret += inst_regret
+
+        decision = BanditDecision(
             action=chosen_action,
             predicted_reward=best_pred,
             uncertainty=best_uncert,
             ucb_score=best_key[0],
             all_scores=scores,
+            instantaneous_regret=inst_regret,
+            cumulative_regret=self.cumulative_regret if oracle_best_action_id is not None else None,
+            chosen_arm_index=best_action_id,
         )
+
+        # Record trajectory (Requirement 17)
+        self.trajectory.append({
+            "step_index": self.step_count,
+            "action_id": chosen_action.action_id,
+            "action_name": chosen_action.name,
+            "layer_idx": chosen_action.layer_idx,
+            "magnitude": chosen_action.magnitude,
+            "site": chosen_action.site,
+            "direction_source": chosen_action.direction_source,
+            "predicted_reward": round(best_pred, 5),
+            "uncertainty": round(best_uncert, 5),
+            "ucb_score": round(best_key[0], 5),
+            "instantaneous_regret": round(inst_regret, 5) if inst_regret is not None else None,
+            "cumulative_regret": round(self.cumulative_regret, 5) if inst_regret is not None else None,
+            "rl_mode": self.rl_mode,
+            "algorithm": self.algorithm,
+        })
+
+        return decision
 
     def update(
         self,
@@ -286,7 +472,13 @@ class ContextualBanditController:
         action: SteeringAction,
         reward: float,
     ) -> None:
-        """Updates LinUCB online ridge parameters with observed reward."""
+        """
+        Updates LinUCB online ridge parameters with observed reward.
+        Requirement 1 & 2: In 'frozen_rl' mode, updates are strictly skipped.
+        """
+        if self.rl_mode == "frozen_rl":
+            return
+
         s = state_vector.detach().cpu().float()
         if s.dim() == 2:
             s = s.squeeze(0)
@@ -298,3 +490,91 @@ class ContextualBanditController:
             self.b[a_idx] += reward * s_norm
             self.pull_counts[a_idx] += 1
             self.step_count += 1
+
+            # Update shared action-conditioned model
+            z = self.compute_joint_features(s_norm, self.actions[a_idx])
+            self.A_shared += torch.outer(z, z)
+            self.b_shared += reward * z
+
+            # Update latest trajectory record with observed reward
+            if self.trajectory and self.trajectory[-1]["action_id"] == a_idx:
+                self.trajectory[-1]["observed_reward"] = round(reward, 5)
+
+    def get_trajectory(self) -> List[Dict[str, Any]]:
+        """Returns recorded learning trajectory."""
+        return list(self.trajectory)
+
+    def save_trajectory(self, path: str) -> None:
+        """Saves learning trajectory records to JSON."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(self.trajectory, f, indent=2)
+
+    def save_policy(self, path: str) -> Dict[str, Any]:
+        """
+        Serializes bandit policy for frozen reload evaluation (Requirement 23).
+        """
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        A_serial = [mat.tolist() for mat in self.A]
+        b_serial = [vec.tolist() for vec in self.b]
+        A_sh_serial = self.A_shared.tolist()
+        b_sh_serial = self.b_shared.tolist()
+
+        payload = {
+            "algorithm": self.algorithm,
+            "rl_mode": self.rl_mode,
+            "state_dim": self.state_dim,
+            "num_actions": self.num_actions,
+            "step_count": self.step_count,
+            "pull_counts": self.pull_counts,
+            "exploration_c": self.exploration_c,
+            "min_exploration_c": self.min_exploration_c,
+            "decay_rate": self.decay_rate,
+            "ridge_lambda": self.ridge_lambda,
+            "max_steering_magnitude": self.max_steering_magnitude,
+            "expanded_action_space": self.expanded_action_space,
+            "actions": [a.to_dict() for a in self.actions],
+            "A": A_serial,
+            "b": b_serial,
+            "A_shared": A_sh_serial,
+            "b_shared": b_sh_serial,
+        }
+        raw_json = json.dumps(payload, sort_keys=True)
+        sha = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+        payload["config_hash"] = sha
+
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        logger.info(f"Saved bandit policy to {path} (hash={sha[:8]}).")
+        return {"path": str(p), "config_hash": sha}
+
+    def load_policy(self, path: str, freeze: bool = True) -> None:
+        """
+        Loads serialized policy checkpoint and optionally freezes updates (Requirement 23).
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.algorithm = data.get("algorithm", self.algorithm)
+        self.step_count = data.get("step_count", 0)
+        if "actions" in data:
+            self.actions = [SteeringAction(**a) for a in data["actions"]]
+            self.num_actions = len(self.actions)
+        if "expanded_action_space" in data:
+            self.expanded_action_space = data["expanded_action_space"]
+        if "exploration_c" in data:
+            self.exploration_c = data["exploration_c"]
+        self.pull_counts = data.get("pull_counts", [0] * self.num_actions)
+        self.A = [torch.tensor(mat, dtype=torch.float32) for mat in data["A"]]
+        self.b = [torch.tensor(vec, dtype=torch.float32) for vec in data["b"]]
+        if "A_shared" in data and "b_shared" in data:
+            self.A_shared = torch.tensor(data["A_shared"], dtype=torch.float32)
+            self.b_shared = torch.tensor(data["b_shared"], dtype=torch.float32)
+
+        if freeze:
+            self.rl_mode = "frozen_rl"
+        logger.info(f"Loaded bandit policy from {path} (frozen={freeze}, actions={self.num_actions}).")

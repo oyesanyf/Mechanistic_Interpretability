@@ -165,6 +165,197 @@ class TestBreakPriorAttempt(unittest.TestCase):
             f"Bandit must pick verified arm L8_mag5.0_full, but unverified pulled arm got chosen: {dec.action.name}"
         )
 
+    def test_break_counterfactual_zero_gain_bug(self):
+        """
+        Break Test 5: Proves that in evaluate_counterfactual_actions, candidate steering actions
+        calculate real refusal gain (steered_refusal - clean_refusal > 0) rather than passing
+        ref_prob for both clean and steered refusal (which previously made gain identically 0).
+        """
+        from deep_noir_rl.controller import AdaptiveSteeringRLController
+
+        class MockConfig:
+            hidden_size = 4
+            num_attention_heads = 1
+        class MockOutput:
+            def __init__(self, logits):
+                self.logits = logits
+        class MockModel:
+            config = MockConfig()
+            def __init__(self):
+                self.call_count = 0
+            def parameters(self):
+                return iter([torch.zeros(1)])
+            def __call__(self, *args, **kwargs):
+                self.call_count += 1
+                # Return distinct logits: baseline has refusal prob ~0.05, steered has ~0.80
+                if self.call_count == 1:
+                    # Clean forward pass
+                    logits = torch.tensor([[[0.0, 0.0, -3.0, 3.0]]])  # token 2 (refusal) low
+                else:
+                    # Steered forward pass
+                    logits = torch.tensor([[[0.0, 0.0, 3.0, -3.0]]])  # token 2 (refusal) high
+                return MockOutput(logits)
+
+        mock_model = MockModel()
+        mock_model.lm_head = torch.nn.Linear(4, 4)
+        mock_model.model = torch.nn.Module()
+        mock_model.model.norm = torch.nn.Identity()
+
+        class MockLayer:
+            def register_forward_hook(self, fn):
+                class Handle:
+                    def remove(self): pass
+                return Handle()
+
+        ctrl = AdaptiveSteeringRLController(
+            model=mock_model,
+            tokenizer=None,
+            layers=[MockLayer() for _ in range(15)],
+            candidate_layers=[8],
+            candidate_magnitudes=[2.5],
+            device="cpu",
+        )
+        ctrl.candidate_layers = [8]
+        # Calibrate a dummy vector so apply_steering works
+        ctrl.steering_manager.cached_directions[8] = SteeringVector(
+            layer_idx=8,
+            raw_vector=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            unit_vector=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            vector_norm=1.0,
+            num_safe_samples=1,
+            num_harmful_samples=1,
+        )
+
+        dummy_inp = {"input_ids": torch.tensor([[1, 2]])}
+        res = ctrl.evaluate_counterfactual_actions(
+            prompt_text="test prompt",
+            inputs=dummy_inp,
+            refusal_ids=[2],
+            language_name="English",
+            prompt_kind="unsafe",
+            epsilon=0.05,
+        )
+        evals = res["candidate_evaluations"]
+        # Find steered action (action_id != 0)
+        steered_acts = [e for aid, e in evals.items() if aid != 0]
+        self.assertGreater(len(steered_acts), 0)
+        for sa in steered_acts:
+            self.assertGreater(
+                sa["refusal_gain"],
+                0.10,
+                f"Refusal gain in counterfactual eval was {sa['refusal_gain']}; prior attempt had 0.0 due to passing ref_prob as clean refusal!"
+            )
+        self.assertIn("action_selection_accuracy", res)
+
+    def test_break_cross_validated_directions_exists(self):
+        """
+        Break Test 6: Proves that compute_cross_validated_directions exists on
+        ContrastiveSteeringManager and computes consensus directions across folds.
+        """
+        class MockConfig:
+            hidden_size = 4
+            num_attention_heads = 1
+        class MockLayer:
+            def register_forward_hook(self, fn):
+                class Handle:
+                    def remove(self): pass
+                return Handle()
+        class MockModel:
+            config = MockConfig()
+            def parameters(self):
+                return iter([torch.zeros(1)])
+        mgr = ContrastiveSteeringManager(model=MockModel(), tokenizer=None, layers=[MockLayer() for _ in range(15)], device="cpu")
+        self.assertTrue(
+            hasattr(mgr, "compute_cross_validated_directions"),
+            "ContrastiveSteeringManager must implement compute_cross_validated_directions (Requirement 20)!"
+        )
+        self.assertTrue(
+            hasattr(mgr, "compute_matched_pair_directions"),
+            "ContrastiveSteeringManager must implement compute_matched_pair_directions (Requirement 20)!"
+        )
+
+    def test_break_bandit_load_policy_actions_desync(self):
+        """
+        Break Test 7: Proves that load_policy properly restores expanded actions
+        when loading a checkpoint saved with expanded_action_space=True.
+        """
+        import tempfile
+        bandit_exp = ContextualBanditController(
+            state_dim=4,
+            candidate_layers=[8, 12],
+            candidate_magnitudes=[1.0, 5.0],
+            expanded_action_space=True,
+        )
+        exp_action_count = len(bandit_exp.actions)
+        self.assertGreater(exp_action_count, 5)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            tmp_path = f.name
+
+        try:
+            bandit_exp.save_policy(tmp_path)
+
+            # Fresh bandit initialized with default expanded_action_space=False
+            bandit_loaded = ContextualBanditController(
+                state_dim=4,
+                candidate_layers=[8, 12],
+                candidate_magnitudes=[1.0, 5.0],
+                expanded_action_space=False,
+            )
+            default_action_count = len(bandit_loaded.actions)
+            self.assertNotEqual(default_action_count, exp_action_count)
+
+            bandit_loaded.load_policy(tmp_path)
+            self.assertEqual(
+                len(bandit_loaded.actions),
+                exp_action_count,
+                "Bandit load_policy must reconstruct actions matching the checkpoint!"
+            )
+            self.assertEqual(len(bandit_loaded.A), len(bandit_loaded.actions))
+        finally:
+            import os
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def test_break_ablation_fallback_covers_all_heads(self):
+        """
+        Break Test 8: Proves that _attribute_heads_ablation_fallback searches
+        across all heads, not capping at 4 heads.
+        """
+        from deep_noir_rl.gradient_attribution import GradientActivationAttributor
+        class MockConfig:
+            hidden_size = 32
+            num_attention_heads = 8
+        class MockOutput:
+            def __init__(self):
+                self.logits = torch.zeros(1, 1, 10)
+        class MockModel:
+            config = MockConfig()
+            def __call__(self, *args, **kwargs):
+                return MockOutput()
+            def parameters(self):
+                return iter([torch.zeros(1)])
+        class MockLayer:
+            def __init__(self):
+                class MockAttn:
+                    def register_forward_hook(self, fn):
+                        class Handle:
+                            def remove(self): pass
+                        return Handle()
+                self.self_attn = MockAttn()
+
+        attributor = GradientActivationAttributor(model=MockModel(), layers=[MockLayer()], device="cpu")
+        self.assertEqual(attributor.num_heads, 8)
+        # Call fallback on layer 0 requesting top 8
+        scores = attributor._attribute_heads_ablation_fallback(
+            inputs={"input_ids": torch.tensor([[1]])},
+            refusal_ids=[2],
+            layer_indices=[0],
+            top_k=8,
+        )
+        # Must evaluate all 8 heads
+        self.assertEqual(len(scores), 8, f"Expected 8 head scores evaluated, but got {len(scores)}!")
+
 
 if __name__ == "__main__":
     unittest.main()

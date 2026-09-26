@@ -47,7 +47,7 @@ class ExtractedState:
 class RLStateExtractor:
     """Featurizes input prompts and model hidden states into normalized RL context state."""
 
-    FEATURE_NAMES = [
+    FEATURE_NAMES_BASE = [
         "norm_token_len",
         "is_african_language",
         "is_unsafe_prompt",
@@ -65,11 +65,41 @@ class RLStateExtractor:
         "overall_injection_risk",
     ]
 
-    def __init__(self, model, tokenizer, layers, device: Optional[str] = None):
+    FEATURE_NAMES_RICH = FEATURE_NAMES_BASE + [
+        "lang_is_yoruba",
+        "lang_is_igbo",
+        "lang_is_hausa",
+        "lang_is_swahili",
+        "lang_is_zulu",
+        "lang_is_english",
+        "language_resource_tier",
+        "pieces_per_refusal_start",
+        "refusal_sequence_score",
+        "rpd_early_profile",
+        "rpd_mid_profile",
+        "rpd_late_profile",
+        "part_b_best_layer_gain",
+        "jacobian_readout_refusal",
+        "prompt_specific_antagonist_score",
+        "top_head_attribution_density",
+    ]
+
+    FEATURE_NAMES = FEATURE_NAMES_BASE
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        layers,
+        device: Optional[str] = None,
+        rich_state: bool = False,
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.layers = layers
         self.device = device or next(model.parameters()).device
+        self.rich_state = rich_state
+        self.FEATURE_NAMES = list(self.FEATURE_NAMES_RICH if rich_state else self.FEATURE_NAMES_BASE)
         self.d_model = self._find_d_model()
         self.n_layers = len(layers)
         self.state_dim = len(self.FEATURE_NAMES)
@@ -158,14 +188,22 @@ class RLStateExtractor:
         prompt_kind: str,
         scaffold_name: str = "baseline",
         antagonist_scores: Optional[List[float]] = None,
+        pieces_per_start: Optional[float] = None,
+        sequence_refusal_score: Optional[float] = None,
+        rpd_profile: Optional[Dict[str, float]] = None,
+        part_b_layer_gains: Optional[Dict[int, float]] = None,
+        jacobian_refusal_prob: Optional[float] = None,
+        prompt_antagonist_scores: Optional[List[float]] = None,
+        head_attributions: Optional[List[Any]] = None,
     ) -> ExtractedState:
         """
-        Computes state features vector s in R^15.
+        Computes normalized state features vector s in R^d (R^15 base, R^31 rich).
         """
         # 1. Input Features
         token_len = inputs["input_ids"].shape[1]
         norm_token_len = min(1.0, token_len / 512.0)
-        is_african = 0.0 if language_name.lower() in ("english", "en") else 1.0
+        lang_lower = language_name.lower()
+        is_african = 0.0 if lang_lower in ("english", "en") else 1.0
         is_unsafe = 1.0 if prompt_kind.lower() == "unsafe" else 0.0
 
         scaffold_weights = {
@@ -237,6 +275,40 @@ class RLStateExtractor:
         # 4. Injection indicators
         pat_score, ent_spike, overall_inj_risk = self.compute_injection_indicator(prompt_text, entropy)
 
+        # 5. Rich Cross-Lingual, Linguistic & Causal Profile Features (Requirement 9)
+        lang_tiers = {
+            "english": 1.0,
+            "en": 1.0,
+            "swahili": 0.65,
+            "sw": 0.65,
+            "hausa": 0.45,
+            "ha": 0.45,
+            "yoruba": 0.35,
+            "yo": 0.35,
+            "igbo": 0.25,
+            "ig": 0.25,
+            "zulu": 0.25,
+            "zu": 0.25,
+        }
+        res_tier = lang_tiers.get(lang_lower, 0.20)
+        norm_pieces = min(1.0, (pieces_per_start if pieces_per_start is not None else 1.0) / 4.0)
+        seq_ref_score = min(1.0, max(0.0, sequence_refusal_score if sequence_refusal_score is not None else clean_refusal))
+
+        rpd_e = float(rpd_profile.get("early", 0.0)) if rpd_profile else 0.0
+        rpd_m = float(rpd_profile.get("mid", 0.0)) if rpd_profile else 0.0
+        rpd_l = float(rpd_profile.get("late", 0.0)) if rpd_profile else 0.0
+
+        pb_gain = float(max(part_b_layer_gains.values(), default=0.0)) if part_b_layer_gains else 0.0
+        j_refusal = float(jacobian_refusal_prob if jacobian_refusal_prob is not None else 0.0)
+
+        prompt_antag = float(max(prompt_antagonist_scores)) if prompt_antagonist_scores else max_antag
+        head_density = 0.0
+        if head_attributions:
+            try:
+                head_density = min(1.0, sum(float(getattr(h, "attribution_score", 0.0)) for h in head_attributions[:3]) / 3.0)
+            except Exception:
+                head_density = 0.0
+
         features = {
             "norm_token_len": round(norm_token_len, 4),
             "is_african_language": is_african,
@@ -253,14 +325,32 @@ class RLStateExtractor:
             "injection_pattern_score": round(pat_score, 4),
             "injection_entropy_spike": round(ent_spike, 4),
             "overall_injection_risk": round(overall_inj_risk, 4),
+            # Rich Extensions
+            "lang_is_yoruba": 1.0 if lang_lower in ("yoruba", "yo") else 0.0,
+            "lang_is_igbo": 1.0 if lang_lower in ("igbo", "ig") else 0.0,
+            "lang_is_hausa": 1.0 if lang_lower in ("hausa", "ha") else 0.0,
+            "lang_is_swahili": 1.0 if lang_lower in ("swahili", "sw") else 0.0,
+            "lang_is_zulu": 1.0 if lang_lower in ("zulu", "zu") else 0.0,
+            "lang_is_english": 1.0 if lang_lower in ("english", "en") else 0.0,
+            "language_resource_tier": round(res_tier, 3),
+            "pieces_per_refusal_start": round(norm_pieces, 4),
+            "refusal_sequence_score": round(seq_ref_score, 6),
+            "rpd_early_profile": round(rpd_e, 4),
+            "rpd_mid_profile": round(rpd_m, 4),
+            "rpd_late_profile": round(rpd_l, 4),
+            "part_b_best_layer_gain": round(pb_gain, 6),
+            "jacobian_readout_refusal": round(j_refusal, 6),
+            "prompt_specific_antagonist_score": round(prompt_antag, 4),
+            "top_head_attribution_density": round(head_density, 4),
         }
 
         vec_list = [features[name] for name in self.FEATURE_NAMES]
         state_tensor = torch.tensor(vec_list, dtype=torch.float32, device=self.device)
+        out_features = {k: features[k] for k in self.FEATURE_NAMES}
 
         return ExtractedState(
             vector=state_tensor,
-            features_dict=features,
+            features_dict=out_features,
             injection_risk=overall_inj_risk,
             clean_refusal_prob=clean_refusal,
             clean_entropy=entropy,

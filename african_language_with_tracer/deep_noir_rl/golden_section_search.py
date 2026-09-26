@@ -40,7 +40,7 @@ class GoldenSectionSearchResult:
 
 
 class DeepNoirGoldenSectionSearcher:
-    """Executes Golden-Section Search to find optimal static steering magnitude with safety rollback."""
+    """Executes coarse bounded grid search followed by local bounded golden-section refinement with safety rollback."""
 
     def __init__(
         self,
@@ -49,20 +49,37 @@ class DeepNoirGoldenSectionSearcher:
         tokenizer,
         device: Optional[str] = None,
         alpha_min: float = 0.0,
-        alpha_max: float = 25.0,
+        alpha_max: float = 5.0,
         max_iterations: int = 10,
         beta_benign_penalty: float = 2.0,
         max_benign_refusal_threshold: float = 0.15,
+        max_permitted_norm: float = 5.0,
+        coarse_grid: Optional[List[float]] = None,
     ):
         self.steering_manager = steering_manager
         self.model = model
         self.tokenizer = tokenizer
         self.device = device or next(model.parameters()).device
-        self.alpha_min = alpha_min
-        self.alpha_max = alpha_max
+        self.alpha_min = max(0.0, float(alpha_min))
+        self.max_permitted_norm = float(max_permitted_norm)
+        self.alpha_max = min(float(alpha_max), self.max_permitted_norm) if self.max_permitted_norm > 0 else float(alpha_max)
         self.max_iterations = max_iterations
         self.beta = beta_benign_penalty
         self.max_benign_refusal = max_benign_refusal_threshold
+
+        if coarse_grid is not None:
+            self.coarse_grid = sorted(list({c for c in coarse_grid if self.alpha_min <= c <= self.alpha_max}))
+        else:
+            base_points = [0.0, 0.5, 1.0, 2.0, 3.5, 5.0]
+            pts = [c for c in base_points if self.alpha_min <= c <= self.alpha_max]
+            if self.alpha_max not in pts:
+                pts.append(self.alpha_max)
+            if self.alpha_min not in pts:
+                pts.append(self.alpha_min)
+            self.coarse_grid = sorted(list(set(pts)))
+
+        if not self.coarse_grid:
+            self.coarse_grid = [self.alpha_min, self.alpha_max]
 
     @torch.no_grad()
     def _evaluate_refusal_prob(self, prompt: str, refusal_ids: List[int]) -> float:
@@ -84,6 +101,7 @@ class DeepNoirGoldenSectionSearcher:
         Evaluates objective:
             Score = mean(P_unsafe_refusal) - beta * mean(P_benign_refusal)
         """
+        magnitude = float(min(max(self.alpha_min, magnitude), self.max_permitted_norm))
         with self.steering_manager.apply_steering(
             layer_idx=layer_idx,
             magnitude=magnitude,
@@ -106,32 +124,55 @@ class DeepNoirGoldenSectionSearcher:
         head_indices: Optional[List[int]] = None,
     ) -> GoldenSectionSearchResult:
         """
-        Runs golden-section search over [alpha_min, alpha_max] to optimize magnitude.
-        Implements rollback if benign accuracy drops or no gain is found.
+        Runs coarse bounded grid search first, then refines locally with bounded golden-section search.
+        Strictly enforces |c| <= max_permitted_norm and executes safety rollback if necessary.
         """
-        a = self.alpha_min
-        b = self.alpha_max
-        history = []
+        history: List[Dict[str, float]] = []
+        eval_cache: Dict[float, Tuple[float, float, float]] = {}
 
-        # Baseline at alpha = 0.0
-        baseline_score, base_unsafe, base_benign = self.evaluate_magnitude(
-            layer_idx, 0.0, unsafe_prompts, benign_prompts, refusal_ids, head_indices
-        )
-        history.append({
-            "alpha": 0.0,
-            "score": round(baseline_score, 5),
-            "unsafe_refusal": round(base_unsafe, 5),
-            "benign_refusal": round(base_benign, 5),
-        })
+        def eval_point(mag: float) -> Tuple[float, float, float]:
+            mag_rounded = round(min(max(self.alpha_min, mag), self.alpha_max), 4)
+            if mag_rounded in eval_cache:
+                return eval_cache[mag_rounded]
+            sc, u, b = self.evaluate_magnitude(
+                layer_idx, mag_rounded, unsafe_prompts, benign_prompts, refusal_ids, head_indices
+            )
+            eval_cache[mag_rounded] = (sc, u, b)
+            history.append({
+                "alpha": mag_rounded,
+                "score": round(sc, 5),
+                "unsafe_refusal": round(u, 5),
+                "benign_refusal": round(b, 5),
+            })
+            return sc, u, b
 
+        # 1. Baseline at alpha = 0.0
+        baseline_score, base_unsafe, base_benign = eval_point(0.0)
+
+        # 2. Coarse grid search
+        grid_scores = []
+        for c_val in self.coarse_grid:
+            sc, u, b = eval_point(c_val)
+            grid_scores.append((c_val, sc, u, b))
+
+        # Identify best coarse point
+        best_coarse_idx = max(range(len(grid_scores)), key=lambda i: grid_scores[i][1])
+        c_star = grid_scores[best_coarse_idx][0]
+
+        # Determine refinement bracket around c_star
+        left_idx = max(0, best_coarse_idx - 1)
+        right_idx = min(len(grid_scores) - 1, best_coarse_idx + 1)
+        a = grid_scores[left_idx][0]
+        b = grid_scores[right_idx][0]
+        if abs(b - a) < 1e-4:
+            a = max(self.alpha_min, c_star - 0.5)
+            b = min(self.alpha_max, c_star + 0.5)
+
+        # 3. Local bounded golden-section refinement
         c = b - INV_PHI * (b - a)
         d = a + INV_PHI * (b - a)
-
-        score_c, u_c, b_c = self.evaluate_magnitude(layer_idx, c, unsafe_prompts, benign_prompts, refusal_ids, head_indices)
-        score_d, u_d, b_d = self.evaluate_magnitude(layer_idx, d, unsafe_prompts, benign_prompts, refusal_ids, head_indices)
-
-        history.append({"alpha": round(c, 3), "score": round(score_c, 5), "unsafe_refusal": round(u_c, 5), "benign_refusal": round(b_c, 5)})
-        history.append({"alpha": round(d, 3), "score": round(score_d, 5), "unsafe_refusal": round(u_d, 5), "benign_refusal": round(b_d, 5)})
+        score_c, u_c, b_c = eval_point(c)
+        score_d, u_d, b_d = eval_point(d)
 
         for _ in range(self.max_iterations):
             if score_c > score_d:
@@ -139,17 +180,15 @@ class DeepNoirGoldenSectionSearcher:
                 d = c
                 score_d, u_d, b_d = score_c, u_c, b_c
                 c = b - INV_PHI * (b - a)
-                score_c, u_c, b_c = self.evaluate_magnitude(layer_idx, c, unsafe_prompts, benign_prompts, refusal_ids, head_indices)
-                history.append({"alpha": round(c, 3), "score": round(score_c, 5), "unsafe_refusal": round(u_c, 5), "benign_refusal": round(b_c, 5)})
+                score_c, u_c, b_c = eval_point(c)
             else:
                 a = c
                 c = d
                 score_c, u_c, b_c = score_d, u_d, b_d
                 d = a + INV_PHI * (b - a)
-                score_d, u_d, b_d = self.evaluate_magnitude(layer_idx, d, unsafe_prompts, benign_prompts, refusal_ids, head_indices)
-                history.append({"alpha": round(d, 3), "score": round(score_d, 5), "unsafe_refusal": round(u_d, 5), "benign_refusal": round(b_d, 5)})
+                score_d, u_d, b_d = eval_point(d)
 
-        # Constrained optimization: filter candidate points satisfying benign refusal threshold
+        # 4. Constrained safety evaluation & rollback check
         feasible_entries = [e for e in history if e["benign_refusal"] <= self.max_benign_refusal]
 
         was_rolled_back = False
