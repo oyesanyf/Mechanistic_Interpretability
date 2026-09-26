@@ -24,6 +24,7 @@ Methodology:
 
 from __future__ import annotations
 
+import math
 import json
 import hashlib
 import logging
@@ -82,6 +83,28 @@ class ActorCriticNetwork(nn.Module):
         self.reward_critic_head = nn.Linear(hidden_dim, 1)
         self.cost_critic_head = nn.Linear(hidden_dim, 1)
 
+        self._init_orthogonal_weights()
+
+    def _init_orthogonal_weights(self):
+        """Applies orthogonal initialization to shared trunk, actor, and critic heads."""
+        for layer in self.shared:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=math.sqrt(2.0))
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+        # Actor head: gain=0.01 for balanced initial policy exploration
+        nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
+        if self.actor_head.bias is not None:
+            nn.init.zeros_(self.actor_head.bias)
+        # Reward critic head: gain=1.0
+        nn.init.orthogonal_(self.reward_critic_head.weight, gain=1.0)
+        if self.reward_critic_head.bias is not None:
+            nn.init.zeros_(self.reward_critic_head.bias)
+        # Cost critic head: gain=1.0
+        nn.init.orthogonal_(self.cost_critic_head.weight, gain=1.0)
+        if self.cost_critic_head.bias is not None:
+            nn.init.zeros_(self.cost_critic_head.bias)
+
     def forward(self, state: torch.Tensor):
         feat = self.shared(state)
         action_logits = self.actor_head(feat)
@@ -106,6 +129,10 @@ class ConstrainedPPOController:
         max_safety_cost_limit: float = 0.35,
         lagrangian_lr: float = 0.05,
         initial_lagrangian: float = 1.0,
+        entropy_coef: float = 0.01,
+        min_entropy_coef: float = 0.001,
+        entropy_decay: float = 0.995,
+        max_grad_norm: float = 0.5,
         device: Optional[str] = None,
         mode: str = "contextual",  # "contextual" (one-step) or "sequential" (multi-stage MDP)
     ):
@@ -135,6 +162,10 @@ class ConstrainedPPOController:
         self.d_limit = max_safety_cost_limit
         self.lagrangian_lr = lagrangian_lr
         self.lagrangian_lambda = initial_lagrangian
+        self.entropy_coef = entropy_coef
+        self.min_entropy_coef = min_entropy_coef
+        self.entropy_decay = entropy_decay
+        self.max_grad_norm = max_grad_norm
 
         self.buffer: List[PPOTypedTransition] = []
         self.trajectory_history: List[Dict[str, Any]] = []
@@ -257,6 +288,14 @@ class ConstrainedPPOController:
         self.lagrangian_lambda = max(0.0, self.lagrangian_lambda + self.lagrangian_lr * cost_violation)
 
         total_loss_accum = 0.0
+        total_policy_loss_accum = 0.0
+        total_reward_loss_accum = 0.0
+        total_cost_loss_accum = 0.0
+        total_entropy_accum = 0.0
+        total_grad_norm_accum = 0.0
+        total_raw_grad_norm_accum = 0.0
+        num_updates = 0
+
         for _ in range(ppo_epochs):
             logits, r_vals, c_vals = self.network(states)
             dist = Categorical(F.softmax(logits, dim=-1))
@@ -285,27 +324,48 @@ class ConstrainedPPOController:
             surr2 = torch.clamp(ratios, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * net_adv
             policy_loss = -torch.min(surr1, surr2).mean()
 
+            # Entropy bonus for exploration stability
+            entropy = dist.entropy().mean()
+
             # Value losses
             v_loss_reward = F.mse_loss(r_vals.view(-1), reward_returns_t.view(-1))
             v_loss_cost = F.mse_loss(c_vals.view(-1), cost_returns_t.view(-1))
 
-            loss = policy_loss + 0.5 * v_loss_reward + 0.5 * v_loss_cost
+            loss = policy_loss - self.entropy_coef * entropy + 0.5 * v_loss_reward + 0.5 * v_loss_cost
 
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
             total_loss_accum += float(loss.item())
+            total_policy_loss_accum += float(policy_loss.item())
+            total_reward_loss_accum += float(v_loss_reward.item())
+            total_cost_loss_accum += float(v_loss_cost.item())
+            total_entropy_accum += float(entropy.item())
+            norm_val = float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm)
+            total_raw_grad_norm_accum += norm_val
+            total_grad_norm_accum += min(norm_val, float(self.max_grad_norm))
+            num_updates += 1
 
+        # Anneal entropy bonus over updates
+        self.entropy_coef = max(self.min_entropy_coef, self.entropy_coef * self.entropy_decay)
         self.buffer.clear()
 
+        divisor = max(1, num_updates)
         metrics = {
             "mean_reward": round(sum(rewards) / max(1, len(rewards)), 5),
             "mean_cost": round(mean_cost, 5),
             "lagrangian_lambda": round(self.lagrangian_lambda, 5),
             "cost_violation": round(cost_violation, 5),
-            "training_loss": round(total_loss_accum / max(1, ppo_epochs), 5),
+            "training_loss": round(total_loss_accum / divisor, 5),
+            "policy_loss": round(total_policy_loss_accum / divisor, 5),
+            "reward_val_loss": round(total_reward_loss_accum / divisor, 5),
+            "cost_val_loss": round(total_cost_loss_accum / divisor, 5),
+            "grad_norm": round(total_grad_norm_accum / divisor, 5),
+            "raw_grad_norm": round(total_raw_grad_norm_accum / divisor, 5),
+            "mean_entropy": round(total_entropy_accum / divisor, 5),
+            "entropy_coef": round(self.entropy_coef, 5),
         }
         self.trajectory_history.append(metrics)
         return metrics
@@ -325,6 +385,10 @@ class ConstrainedPPOController:
             "hidden_dim": self.hidden_dim,
             "gamma": self.gamma,
             "d_limit": self.d_limit,
+            "entropy_coef": self.entropy_coef,
+            "min_entropy_coef": self.min_entropy_coef,
+            "entropy_decay": self.entropy_decay,
+            "max_grad_norm": self.max_grad_norm,
             "actions": [a.to_dict() for a in self.actions],
         }, str(p))
 
@@ -339,7 +403,15 @@ class ConstrainedPPOController:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.lagrangian_lambda = checkpoint.get("lagrangian_lambda", self.lagrangian_lambda)
         self.gamma = checkpoint.get("gamma", self.gamma)
+        self.entropy_coef = checkpoint.get("entropy_coef", self.entropy_coef)
+        self.min_entropy_coef = checkpoint.get("min_entropy_coef", self.min_entropy_coef)
+        self.entropy_decay = checkpoint.get("entropy_decay", self.entropy_decay)
+        self.max_grad_norm = checkpoint.get("max_grad_norm", self.max_grad_norm)
         logger.info(f"Loaded PPO policy checkpoint from {path}.")
+
+
+# Alias for compatibility with external references
+PPOSteeringController = ConstrainedPPOController
 
 
 class SequentialSteeringMDP:

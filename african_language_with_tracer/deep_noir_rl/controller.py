@@ -74,6 +74,8 @@ class AdaptiveSteeringRLController:
         exploration_c: float = 1.25,
         max_injection_risk: float = 0.45,
         max_benign_refusal: float = 0.15,
+        min_refusal_gain: float = 0.005,
+        alpha_decay: float = 0.05,
         hardware_profile: Optional[HardwareProfile] = None,
         eval_mode: str = "train",  # "train", "validation", "frozen_test"
         rl_mode: str = "partb_prior_rl",  # "cold_rl", "partb_prior_rl", "frozen_rl"
@@ -89,6 +91,8 @@ class AdaptiveSteeringRLController:
         self.policy_type = policy_type.lower()
         self.candidate_layers = candidate_layers or [8, 12]
         self.candidate_magnitudes = candidate_magnitudes or [1.0, 2.5, 5.0]
+        self.min_refusal_gain = min_refusal_gain
+        self.alpha_decay = alpha_decay
         self.eval_mode = eval_mode.lower()
         self.rl_mode = rl_mode.lower()
         self.expanded_action_space = expanded_action_space
@@ -128,6 +132,7 @@ class AdaptiveSteeringRLController:
         self.reward_evaluator = GraduatedRewardEvaluator(
             max_injection_risk=max_injection_risk,
             max_benign_refusal=max_benign_refusal,
+            min_refusal_gain_threshold=min_refusal_gain,
             max_steering_magnitude=max_mag,
         )
 
@@ -138,6 +143,7 @@ class AdaptiveSteeringRLController:
                 candidate_layers=self.candidate_layers,
                 candidate_magnitudes=self.candidate_magnitudes,
                 exploration_c=exploration_c,
+                alpha_decay=self.alpha_decay,
                 expanded_action_space=self.expanded_action_space,
                 algorithm=self.bandit_algorithm,
                 rl_mode=self.rl_mode,
@@ -511,10 +517,11 @@ class AdaptiveSteeringRLController:
             steered_entropy = clean_entropy
             executed_action = SteeringAction(action_id=0, name="No Steering (Rollback)", layer_idx=None, magnitude=0.0, is_no_op=True)
             audit.append(f"ROLLBACK EXECUTED: {rollback_reason} Restored clean output.")
-        elif prompt_kind == "unsafe" and not executed_action.is_no_op and (steered_refusal < clean_refusal - 1e-5):
+        elif prompt_kind == "unsafe" and not executed_action.is_no_op and (steered_refusal < clean_refusal + self.min_refusal_gain - 1e-8):
             was_rolled_back = True
-            rollback_reason = f"Post-execution barrier: Unsafe refusal degradation ({steered_refusal:.4f} < clean {clean_refusal:.4f})."
-            if allow_part_b and best_verified_gain > 0 and best_layer is not None:
+            gain_val = steered_refusal - clean_refusal
+            rollback_reason = f"Post-execution barrier: Unsafe refusal gain ({gain_val:+.4f} < {self.min_refusal_gain:.4f} min threshold)."
+            if allow_part_b and best_verified_gain >= self.min_refusal_gain and best_layer is not None:
                 steered_refusal = clean_refusal + best_verified_gain
                 if best_awakening is not None and getattr(best_awakening, "awakened_entropy", None) is not None:
                     steered_entropy = best_awakening.awakened_entropy

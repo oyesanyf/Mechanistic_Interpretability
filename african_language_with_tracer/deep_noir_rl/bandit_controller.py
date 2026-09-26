@@ -64,6 +64,52 @@ class BanditDecision:
     chosen_arm_index: Optional[int] = None
 
 
+def stable_covariance_inverse(A: torch.Tensor, ridge_eps: float = 1e-4) -> torch.Tensor:
+    """
+    Computes strictly positive-definite matrix inverse of covariance matrix A.
+    Applies adaptive Tikhonov/ridge regularization and pseudo-inverse / Cholesky fallbacks
+    ensuring numerical stability and non-degeneracy, immune to NaNs/Infs and singular states.
+    """
+    dim = A.shape[0]
+    A_clean = torch.nan_to_num(A.detach().cpu().float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    A_sym = 0.5 * (A_clean + A_clean.transpose(-1, -2))
+
+    # Fast path: try exact Cholesky first (reg=0.0), then adaptive Tikhonov regularization
+    for reg in [0.0, ridge_eps, max(1e-4, ridge_eps * 10.0), 0.01, 0.1, 1.0]:
+        try:
+            A_reg = A_sym if reg == 0.0 else (A_sym + reg * torch.eye(dim, dtype=A_sym.dtype))
+            L = torch.linalg.cholesky(A_reg)
+            inv = torch.cholesky_inverse(L)
+            inv = 0.5 * (inv + inv.transpose(-1, -2))
+            if not torch.isnan(inv).any() and not torch.isinf(inv).any():
+                eigs = torch.linalg.eigvalsh(inv)
+                if (eigs > 1e-7).all():
+                    return inv
+        except (torch.linalg.LinAlgError, RuntimeError):
+            continue
+
+    # Fallback: eigenvalue decomposition with eigenvalue clamping for strict positive-definiteness
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(A_sym)
+        clamped_eigenvalues = torch.clamp(eigenvalues, min=1e-5)
+        inv = eigenvectors @ torch.diag(1.0 / clamped_eigenvalues) @ eigenvectors.transpose(-1, -2)
+        inv = 0.5 * (inv + inv.transpose(-1, -2))
+        if not torch.isnan(inv).any() and not torch.isinf(inv).any():
+            return inv
+    except Exception:
+        pass
+
+    # Ultimate fallback: regularized pseudo-inverse with eigenvalue projection to guarantee positive-definiteness
+    try:
+        pinv = torch.linalg.pinv(A_sym + max(1e-3, ridge_eps) * torch.eye(dim, dtype=A_sym.dtype))
+        eigs, vecs = torch.linalg.eigh(0.5 * (pinv + pinv.transpose(-1, -2)))
+        clamped = torch.clamp(eigs, min=1e-5)
+        inv = vecs @ torch.diag(clamped) @ vecs.transpose(-1, -2)
+        return 0.5 * (inv + inv.transpose(-1, -2))
+    except Exception:
+        return torch.eye(dim, dtype=torch.float32)
+
+
 class ContextualBanditController:
     """Contextual Bandit controller for adaptive per-input steering control."""
 
@@ -79,6 +125,7 @@ class ContextualBanditController:
         exploration_c: float = 0.25,
         min_exploration_c: float = 0.10,
         decay_rate: float = 0.995,
+        alpha_decay: float = 0.05,
         ridge_lambda: float = 1.0,
         algorithm: str = "linucb",  # "linucb", "action_conditioned", "thompson_sampling"
         rl_mode: str = "partb_prior_rl",   # "cold_rl", "partb_prior_rl", "frozen_rl"
@@ -94,6 +141,7 @@ class ContextualBanditController:
         self.exploration_c = exploration_c
         self.min_exploration_c = min_exploration_c
         self.decay_rate = decay_rate
+        self.alpha_decay = alpha_decay
         self.ridge_lambda = ridge_lambda
         self.algorithm = algorithm.lower()
         self.rl_mode = rl_mode.lower()
@@ -117,7 +165,18 @@ class ContextualBanditController:
         # Shared action-conditioned model representation (Requirement 7)
         # Action feature dim = 7 (normalized layer, normalized mag, is_heads, is_write_site, is_transported, is_awakening, is_no_op)
         self.action_feat_dim = 7
-        self.joint_dim = self.state_dim + self.action_feat_dim + (min(4, self.state_dim) * 3)
+        # Salient state indices for bilinear / cross-product interaction terms
+        # Captures language one-hot, tokenizer fragmentation, target layer RPD, and safety risks
+        if self.state_dim >= 31:
+            self.salient_state_indices = [1, 2, 5, 7, 9, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26]
+        elif self.state_dim >= 15:
+            self.salient_state_indices = [1, 2, 4, 5, 6, 7, 8, 9, 11, 14]
+        else:
+            self.salient_state_indices = list(range(self.state_dim))
+
+        self.salient_action_indices = list(range(self.action_feat_dim))  # layer, mag, heads, site, trans, aw, no_op
+        self.cross_dim = len(self.salient_state_indices) * len(self.salient_action_indices)
+        self.joint_dim = self.state_dim + self.action_feat_dim + self.cross_dim
         self.A_shared = self.ridge_lambda * torch.eye(self.joint_dim, dtype=torch.float32)
         self.b_shared = torch.zeros(self.joint_dim, dtype=torch.float32)
 
@@ -226,28 +285,47 @@ class ContextualBanditController:
 
         min_l = min(self.candidate_layers) if self.candidate_layers else 0
         max_l = max(self.candidate_layers) if self.candidate_layers else 24
-        l_norm = (action.layer_idx - min_l) / max(1.0, float(max_l - min_l)) if action.layer_idx is not None else 0.5
-        m_norm = min(1.0, action.magnitude / max(1e-5, self.max_steering_magnitude))
+        # Offset by 1.0 so minimum candidate layer has distinct non-zero encoding for cross-product interactions
+        l_norm = (action.layer_idx - min_l + 1.0) / max(1.0, float(max_l - min_l + 1.0)) if action.layer_idx is not None else 0.5
+        m_norm = min(1.0, max(0.1, action.magnitude / max(1e-5, self.max_steering_magnitude)))
 
         feats[0] = float(l_norm)
         feats[1] = float(m_norm)
-        feats[2] = 1.0 if action.target_heads is not None else 0.0
-        feats[3] = 1.0 if action.site == "fresh_write" else 0.0
-        feats[4] = 1.0 if "transport" in action.direction_source else 0.0
-        feats[5] = 1.0 if "awake" in action.direction_source else 0.0
+        feats[2] = 1.0 if action.target_heads is not None else 0.5
+        feats[3] = 1.0 if action.site == "fresh_write" else 0.5
+        feats[4] = 1.0 if "transport" in action.direction_source else 0.2
+        feats[5] = 1.0 if "awake" in action.direction_source else (0.6 if "native" in action.direction_source else 0.2)
         feats[6] = 0.0
         return feats
 
     def compute_joint_features(self, state_norm: torch.Tensor, action: SteeringAction) -> torch.Tensor:
-        """Constructs joint context-action representation psi(s, a)."""
+        """
+        Constructs rich joint context-action representation psi(s, a).
+        Forms bilinear / cross-product interaction terms between key state features
+        (language one-hot, tokenizer fragmentation, target layer RPD, safety indicators)
+        and action features (layer depth, normalized magnitude, steering site, head mode).
+        Guarantees dimension invariance through padding / truncation.
+        """
+        if state_norm.shape[0] < self.state_dim:
+            s_fixed = torch.zeros(self.state_dim, dtype=state_norm.dtype, device=state_norm.device)
+            s_fixed[:state_norm.shape[0]] = state_norm
+            state_norm = s_fixed
+        elif state_norm.shape[0] > self.state_dim:
+            state_norm = state_norm[:self.state_dim]
+
         phi_a = self.compute_action_features(action)
-        s_part = state_norm[:min(4, state_norm.shape[0])]
-        cross_term = torch.outer(s_part, phi_a[:3]).flatten()
+        s_part = state_norm[self.salient_state_indices]
+        a_part = phi_a[self.salient_action_indices]
+        cross_term = torch.outer(s_part, a_part).flatten()
         return torch.cat([state_norm, phi_a, cross_term], dim=0)
 
     def get_current_exploration_c(self) -> float:
-        """Decays exploration constant over time."""
-        c = self.exploration_c * (self.decay_rate ** self.step_count)
+        """
+        Decays exploration constant over time:
+            c(t) = c_0 / sqrt(1 + alpha_decay * t)
+        Prevents chronic over-exploration late in training while maintaining robust initial discovery.
+        """
+        c = self.exploration_c / math.sqrt(1.0 + self.alpha_decay * self.step_count)
         return max(self.min_exploration_c, c)
 
     def warm_start_arm(
@@ -263,7 +341,7 @@ class ContextualBanditController:
         Warm-starts / seeds a bandit arm with prior verified evidence (e.g. from Part B awakening).
         Requirement 2: Strictly disabled in 'cold_rl' and 'frozen_rl' modes to prevent test leakage.
         """
-        if self.rl_mode == "frozen_rl":
+        if self.rl_mode in ("cold_rl", "frozen_rl"):
             return None
 
         matching_idx = None
@@ -289,6 +367,12 @@ class ContextualBanditController:
                 s = state_vector.detach().cpu().float()
                 if s.dim() == 2:
                     s = s.squeeze(0)
+                if s.shape[0] < self.state_dim:
+                    s_pad = torch.zeros(self.state_dim, dtype=torch.float32)
+                    s_pad[:s.shape[0]] = s
+                    s = s_pad
+                elif s.shape[0] > self.state_dim:
+                    s = s[:self.state_dim]
                 s_norm = s / (torch.norm(s) + 1e-8)
                 self.A[matching_idx] += confidence_weight * torch.outer(s_norm, s_norm)
                 self.b[matching_idx] += (confidence_weight * reward) * s_norm
@@ -299,6 +383,10 @@ class ContextualBanditController:
                 self.b_shared += (confidence_weight * reward) * z
             else:
                 self.b[matching_idx] += (confidence_weight * reward) * (1.0 / math.sqrt(self.state_dim))
+                dummy_s = torch.zeros(self.state_dim, dtype=torch.float32)
+                z = self.compute_joint_features(dummy_s, self.actions[matching_idx])
+                self.A_shared += confidence_weight * torch.outer(z, z)
+                self.b_shared += (confidence_weight * reward) * z
 
             self.pull_counts[matching_idx] += int(confidence_weight)
             self.last_verified_arm_id = matching_idx
@@ -316,11 +404,18 @@ class ContextualBanditController:
         verified_arm_id: Optional[int] = None,
         verified_gain: float = 0.0,
         oracle_best_action_id: Optional[int] = None,
+        deterministic: bool = False,
     ) -> BanditDecision:
         """Selects action via LinUCB, Shared Action-Conditioned Model, or Thompson Sampling."""
         s = state_vector.detach().cpu().float()
         if s.dim() == 2:
             s = s.squeeze(0)
+        if s.shape[0] < self.state_dim:
+            s_pad = torch.zeros(self.state_dim, dtype=torch.float32)
+            s_pad[:s.shape[0]] = s
+            s = s_pad
+        elif s.shape[0] > self.state_dim:
+            s = s[:self.state_dim]
         s_norm = s / (torch.norm(s) + 1e-8)
 
         # In cold_rl or frozen_rl, ignore any verified arm injected at test time
@@ -335,7 +430,11 @@ class ContextualBanditController:
                 self.last_verified_arm_id = None
                 self.last_verified_reward = None
 
-        c = self.get_current_exploration_c()
+        if deterministic or self.rl_mode == "frozen_rl":
+            c = 0.0
+        else:
+            c = self.get_current_exploration_c()
+
         scores: Dict[int, float] = {}
         best_action_id = 0
         best_key = (-float("inf"), -1, -1, -1, -1)
@@ -346,7 +445,7 @@ class ContextualBanditController:
         shared_theta = None
         A_shared_inv = None
         if self.algorithm == "action_conditioned":
-            A_shared_inv = torch.linalg.pinv(self.A_shared)
+            A_shared_inv = stable_covariance_inverse(self.A_shared, ridge_eps=self.ridge_lambda * 1e-3)
             shared_theta = torch.matmul(A_shared_inv, self.b_shared)
 
         for a_idx in range(self.num_actions):
@@ -360,11 +459,12 @@ class ContextualBanditController:
                 uncertainty = math.sqrt(max(0.0, var))
             elif self.algorithm == "thompson_sampling":
                 # Contextual Thompson Sampling (Requirement 7)
-                A_inv = torch.linalg.pinv(self.A[a_idx])
+                A_inv = stable_covariance_inverse(self.A[a_idx], ridge_eps=self.ridge_lambda * 1e-3)
                 mu = torch.matmul(A_inv, self.b[a_idx])
                 cov = 0.25 * A_inv
+                cov = 0.5 * (cov + cov.T) + 1e-5 * torch.eye(self.state_dim)
                 try:
-                    dist = torch.distributions.MultivariateNormal(mu, cov + 1e-6 * torch.eye(self.state_dim))
+                    dist = torch.distributions.MultivariateNormal(mu, cov)
                     theta_sample = dist.sample()
                 except Exception:
                     theta_sample = mu
@@ -374,11 +474,13 @@ class ContextualBanditController:
                 thompson_pred = torch.dot(theta_sample, s_norm).item()
             else:
                 # Standard LinUCB
-                A_inv = torch.linalg.pinv(self.A[a_idx])
+                A_inv = stable_covariance_inverse(self.A[a_idx], ridge_eps=self.ridge_lambda * 1e-3)
                 theta = torch.matmul(A_inv, self.b[a_idx])
                 pred = torch.dot(theta, s_norm).item()
                 var = torch.dot(s_norm, torch.matmul(A_inv, s_norm)).item()
                 uncertainty = math.sqrt(max(0.0, var))
+
+            unpulled_bonus = c if (self.pull_counts[a_idx] == 0 and not action.is_no_op and prompt_kind == "unsafe" and not deterministic and self.rl_mode != "frozen_rl") else 0.0
 
             if self.algorithm == "thompson_sampling":
                 score = thompson_pred
@@ -393,8 +495,7 @@ class ContextualBanditController:
                         mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / max(1e-5, self.max_steering_magnitude)))
                         score = pred + c_eff * uncertainty - mag_cost
                 else:
-                    mag_cost = 0.15 * (0.7 * min(1.0, action.magnitude / max(1e-5, self.max_steering_magnitude))) if self.pull_counts[a_idx] == 0 else 0.0
-                    score = pred + c * uncertainty - mag_cost
+                    score = pred + c * uncertainty + unpulled_bonus
             else:
                 score = pred + c * uncertainty
             scores[a_idx] = score
@@ -482,6 +583,12 @@ class ContextualBanditController:
         s = state_vector.detach().cpu().float()
         if s.dim() == 2:
             s = s.squeeze(0)
+        if s.shape[0] < self.state_dim:
+            s_pad = torch.zeros(self.state_dim, dtype=torch.float32)
+            s_pad[:s.shape[0]] = s
+            s = s_pad
+        elif s.shape[0] > self.state_dim:
+            s = s[:self.state_dim]
         s_norm = s / (torch.norm(s) + 1e-8)
 
         a_idx = action.action_id
@@ -533,9 +640,12 @@ class ContextualBanditController:
             "exploration_c": self.exploration_c,
             "min_exploration_c": self.min_exploration_c,
             "decay_rate": self.decay_rate,
+            "alpha_decay": self.alpha_decay,
             "ridge_lambda": self.ridge_lambda,
             "max_steering_magnitude": self.max_steering_magnitude,
             "expanded_action_space": self.expanded_action_space,
+            "cross_dim": self.cross_dim,
+            "joint_dim": self.joint_dim,
             "actions": [a.to_dict() for a in self.actions],
             "A": A_serial,
             "b": b_serial,
@@ -568,12 +678,15 @@ class ContextualBanditController:
             self.expanded_action_space = data["expanded_action_space"]
         if "exploration_c" in data:
             self.exploration_c = data["exploration_c"]
+        if "alpha_decay" in data:
+            self.alpha_decay = data["alpha_decay"]
         self.pull_counts = data.get("pull_counts", [0] * self.num_actions)
         self.A = [torch.tensor(mat, dtype=torch.float32) for mat in data["A"]]
         self.b = [torch.tensor(vec, dtype=torch.float32) for vec in data["b"]]
         if "A_shared" in data and "b_shared" in data:
             self.A_shared = torch.tensor(data["A_shared"], dtype=torch.float32)
             self.b_shared = torch.tensor(data["b_shared"], dtype=torch.float32)
+            self.joint_dim = self.A_shared.shape[0]
 
         if freeze:
             self.rl_mode = "frozen_rl"
