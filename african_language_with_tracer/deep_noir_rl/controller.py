@@ -154,6 +154,7 @@ class AdaptiveSteeringRLController:
                 state_dim=self.state_extractor.state_dim,
                 candidate_layers=self.candidate_layers,
                 candidate_magnitudes=self.candidate_magnitudes,
+                expanded_action_space=self.expanded_action_space,
                 device=self.device,
             )
             self.bandit = None

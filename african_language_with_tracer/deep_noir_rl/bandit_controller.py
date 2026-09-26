@@ -69,8 +69,11 @@ def stable_covariance_inverse(A: torch.Tensor, ridge_eps: float = 1e-4) -> torch
     Computes strictly positive-definite matrix inverse of covariance matrix A.
     Applies adaptive Tikhonov/ridge regularization and pseudo-inverse / Cholesky fallbacks
     ensuring numerical stability and non-degeneracy, immune to NaNs/Infs and singular states.
+    Preserves input device and dtype.
     """
-    dim = A.shape[0]
+    orig_device = A.device
+    orig_dtype = A.dtype
+    dim = A.shape[-1]
     A_clean = torch.nan_to_num(A.detach().cpu().float(), nan=0.0, posinf=1e4, neginf=-1e4)
     A_sym = 0.5 * (A_clean + A_clean.transpose(-1, -2))
 
@@ -84,7 +87,7 @@ def stable_covariance_inverse(A: torch.Tensor, ridge_eps: float = 1e-4) -> torch
             if not torch.isnan(inv).any() and not torch.isinf(inv).any():
                 eigs = torch.linalg.eigvalsh(inv)
                 if (eigs > 1e-7).all():
-                    return inv
+                    return inv.to(device=orig_device, dtype=orig_dtype)
         except (torch.linalg.LinAlgError, RuntimeError):
             continue
 
@@ -95,7 +98,7 @@ def stable_covariance_inverse(A: torch.Tensor, ridge_eps: float = 1e-4) -> torch
         inv = eigenvectors @ torch.diag(1.0 / clamped_eigenvalues) @ eigenvectors.transpose(-1, -2)
         inv = 0.5 * (inv + inv.transpose(-1, -2))
         if not torch.isnan(inv).any() and not torch.isinf(inv).any():
-            return inv
+            return inv.to(device=orig_device, dtype=orig_dtype)
     except Exception:
         pass
 
@@ -105,9 +108,9 @@ def stable_covariance_inverse(A: torch.Tensor, ridge_eps: float = 1e-4) -> torch
         eigs, vecs = torch.linalg.eigh(0.5 * (pinv + pinv.transpose(-1, -2)))
         clamped = torch.clamp(eigs, min=1e-5)
         inv = vecs @ torch.diag(clamped) @ vecs.transpose(-1, -2)
-        return 0.5 * (inv + inv.transpose(-1, -2))
+        return (0.5 * (inv + inv.transpose(-1, -2))).to(device=orig_device, dtype=orig_dtype)
     except Exception:
-        return torch.eye(dim, dtype=torch.float32)
+        return torch.eye(dim, dtype=orig_dtype, device=orig_device)
 
 
 class ContextualBanditController:
@@ -286,7 +289,8 @@ class ContextualBanditController:
         min_l = min(self.candidate_layers) if self.candidate_layers else 0
         max_l = max(self.candidate_layers) if self.candidate_layers else 24
         # Offset by 1.0 so minimum candidate layer has distinct non-zero encoding for cross-product interactions
-        l_norm = (action.layer_idx - min_l + 1.0) / max(1.0, float(max_l - min_l + 1.0)) if action.layer_idx is not None else 0.5
+        raw_l = (action.layer_idx - min_l + 1.0) / max(1.0, float(max_l - min_l + 1.0)) if action.layer_idx is not None else 0.5
+        l_norm = min(1.0, max(0.05, float(raw_l)))
         m_norm = min(1.0, max(0.1, action.magnitude / max(1e-5, self.max_steering_magnitude)))
 
         feats[0] = float(l_norm)
@@ -304,7 +308,7 @@ class ContextualBanditController:
         Forms bilinear / cross-product interaction terms between key state features
         (language one-hot, tokenizer fragmentation, target layer RPD, safety indicators)
         and action features (layer depth, normalized magnitude, steering site, head mode).
-        Guarantees dimension invariance through padding / truncation.
+        Guarantees dimension and device invariance through padding / truncation.
         """
         if state_norm.shape[0] < self.state_dim:
             s_fixed = torch.zeros(self.state_dim, dtype=state_norm.dtype, device=state_norm.device)
@@ -313,7 +317,7 @@ class ContextualBanditController:
         elif state_norm.shape[0] > self.state_dim:
             state_norm = state_norm[:self.state_dim]
 
-        phi_a = self.compute_action_features(action)
+        phi_a = self.compute_action_features(action).to(device=state_norm.device, dtype=state_norm.dtype)
         s_part = state_norm[self.salient_state_indices]
         a_part = phi_a[self.salient_action_indices]
         cross_term = torch.outer(s_part, a_part).flatten()
@@ -461,16 +465,22 @@ class ContextualBanditController:
                 # Contextual Thompson Sampling (Requirement 7)
                 A_inv = stable_covariance_inverse(self.A[a_idx], ridge_eps=self.ridge_lambda * 1e-3)
                 mu = torch.matmul(A_inv, self.b[a_idx])
-                cov = 0.25 * A_inv
-                cov = 0.5 * (cov + cov.T) + 1e-5 * torch.eye(self.state_dim)
-                try:
-                    dist = torch.distributions.MultivariateNormal(mu, cov)
-                    theta_sample = dist.sample()
-                except Exception:
-                    theta_sample = mu
                 pred = torch.dot(mu, s_norm).item()
                 var = torch.dot(s_norm, torch.matmul(A_inv, s_norm)).item()
                 uncertainty = math.sqrt(max(0.0, var))
+
+                if deterministic or self.rl_mode == "frozen_rl" or c <= 0.0:
+                    theta_sample = mu
+                else:
+                    # Posterior sampling scaled by annealed exploration factor c(t)
+                    cov = (c ** 2) * A_inv
+                    cov = 0.5 * (cov + cov.T) + 1e-5 * torch.eye(self.state_dim)
+                    try:
+                        dist = torch.distributions.MultivariateNormal(mu, cov)
+                        theta_sample = dist.sample()
+                    except Exception:
+                        theta_sample = mu
+
                 thompson_pred = torch.dot(theta_sample, s_norm).item()
             else:
                 # Standard LinUCB
@@ -480,7 +490,8 @@ class ContextualBanditController:
                 var = torch.dot(s_norm, torch.matmul(A_inv, s_norm)).item()
                 uncertainty = math.sqrt(max(0.0, var))
 
-            unpulled_bonus = c if (self.pull_counts[a_idx] == 0 and not action.is_no_op and prompt_kind == "unsafe" and not deterministic and self.rl_mode != "frozen_rl") else 0.0
+            # Unpulled arm exploration bonus: applies to independent models (LinUCB) where arms don't share parameters
+            unpulled_bonus = c if (self.algorithm not in ("action_conditioned", "thompson_sampling") and self.pull_counts[a_idx] == 0 and not action.is_no_op and prompt_kind == "unsafe" and not deterministic and self.rl_mode != "frozen_rl") else 0.0
 
             if self.algorithm == "thompson_sampling":
                 score = thompson_pred
@@ -671,6 +682,18 @@ class ContextualBanditController:
 
         self.algorithm = data.get("algorithm", self.algorithm)
         self.step_count = data.get("step_count", 0)
+        if "state_dim" in data:
+            self.state_dim = data["state_dim"]
+            # Reconstruct salient state indices if state_dim changed
+            if self.state_dim >= 31:
+                self.salient_state_indices = [1, 2, 5, 7, 9, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26]
+            elif self.state_dim >= 15:
+                self.salient_state_indices = [1, 2, 4, 5, 6, 7, 8, 9, 11, 14]
+            else:
+                self.salient_state_indices = list(range(self.state_dim))
+            self.cross_dim = len(self.salient_state_indices) * len(self.salient_action_indices)
+            self.joint_dim = self.state_dim + self.action_feat_dim + self.cross_dim
+
         if "actions" in data:
             self.actions = [SteeringAction(**a) for a in data["actions"]]
             self.num_actions = len(self.actions)
@@ -678,8 +701,17 @@ class ContextualBanditController:
             self.expanded_action_space = data["expanded_action_space"]
         if "exploration_c" in data:
             self.exploration_c = data["exploration_c"]
+        if "min_exploration_c" in data:
+            self.min_exploration_c = data["min_exploration_c"]
+        if "decay_rate" in data:
+            self.decay_rate = data["decay_rate"]
         if "alpha_decay" in data:
             self.alpha_decay = data["alpha_decay"]
+        if "ridge_lambda" in data:
+            self.ridge_lambda = data["ridge_lambda"]
+        if "max_steering_magnitude" in data:
+            self.max_steering_magnitude = data["max_steering_magnitude"]
+
         self.pull_counts = data.get("pull_counts", [0] * self.num_actions)
         self.A = [torch.tensor(mat, dtype=torch.float32) for mat in data["A"]]
         self.b = [torch.tensor(vec, dtype=torch.float32) for vec in data["b"]]
@@ -690,4 +722,4 @@ class ContextualBanditController:
 
         if freeze:
             self.rl_mode = "frozen_rl"
-        logger.info(f"Loaded bandit policy from {path} (frozen={freeze}, actions={self.num_actions}).")
+        logger.info(f"Loaded bandit policy from {path} (frozen={freeze}, actions={self.num_actions}, state_dim={self.state_dim}).")

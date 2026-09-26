@@ -122,6 +122,9 @@ class ConstrainedPPOController:
         actions: Optional[List[SteeringAction]] = None,
         candidate_layers: Optional[List[int]] = None,
         candidate_magnitudes: Optional[List[float]] = None,
+        candidate_sites: Optional[List[str]] = None,
+        candidate_direction_sources: Optional[List[str]] = None,
+        expanded_action_space: bool = False,
         hidden_dim: int = 64,
         lr: float = 3e-4,
         gamma: float = 0.0,  # Requirement 5: Default gamma=0.0 for independent prompt contextual optimization
@@ -141,6 +144,7 @@ class ConstrainedPPOController:
         self.lr = lr
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.mode = mode.lower()
+        self.expanded_action_space = expanded_action_space
 
         if actions is not None:
             self.actions = actions
@@ -150,6 +154,9 @@ class ConstrainedPPOController:
                 state_dim=state_dim,
                 candidate_layers=candidate_layers or [12, 16, 20],
                 candidate_magnitudes=candidate_magnitudes or [5.0, 12.0, 20.0],
+                candidate_sites=candidate_sites,
+                candidate_direction_sources=candidate_direction_sources,
+                expanded_action_space=expanded_action_space,
             )
             self.actions = dummy_bandit.actions
 
@@ -233,8 +240,11 @@ class ConstrainedPPOController:
         done: bool = True,  # Explicit episode boundary (Requirement 5)
     ) -> None:
         """Appends step transition to rollout buffer with episode boundary tracking."""
+        s = state.detach().cpu()
+        if s.dim() > 1:
+            s = s.squeeze()
         self.buffer.append(PPOTypedTransition(
-            state=state.detach().cpu(),
+            state=s,
             action_index=action_index,
             reward=reward,
             cost=cost,
@@ -316,8 +326,7 @@ class ConstrainedPPOController:
                     net_adv = (net_adv - net_adv.mean()) / (adv_std + 1e-8)
                 else:
                     net_adv = net_adv - net_adv.mean()
-            else:
-                net_adv = net_adv - net_adv.mean()
+            # Note: if net_adv.numel() == 1, retain uncentered value so scalar advantages do not cancel to zero
 
             # Clipped surrogate objective
             surr1 = ratios * net_adv
@@ -397,17 +406,40 @@ class ConstrainedPPOController:
 
     def load_policy(self, path: str) -> None:
         """Loads serialized PPO policy checkpoint (Requirement 23)."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Restore action space and dimensions if present
+        if "actions" in checkpoint:
+            self.actions = [SteeringAction(**a) for a in checkpoint["actions"]]
+            self.num_actions = len(self.actions)
+        elif "num_actions" in checkpoint:
+            self.num_actions = checkpoint["num_actions"]
+
+        if "state_dim" in checkpoint:
+            self.state_dim = checkpoint["state_dim"]
+        if "hidden_dim" in checkpoint:
+            self.hidden_dim = checkpoint["hidden_dim"]
+
+        # Adapt network architecture if dimensions or actions changed
+        if (
+            self.network.actor_head.out_features != self.num_actions
+            or self.network.state_dim != self.state_dim
+            or self.network.hidden_dim != self.hidden_dim
+        ):
+            self.network = ActorCriticNetwork(self.state_dim, self.num_actions, self.hidden_dim).to(self.device)
+            self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.lr)
+
         self.network.load_state_dict(checkpoint["state_dict"])
         if "optimizer_state" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.lagrangian_lambda = checkpoint.get("lagrangian_lambda", self.lagrangian_lambda)
         self.gamma = checkpoint.get("gamma", self.gamma)
+        self.d_limit = checkpoint.get("d_limit", self.d_limit)
         self.entropy_coef = checkpoint.get("entropy_coef", self.entropy_coef)
         self.min_entropy_coef = checkpoint.get("min_entropy_coef", self.min_entropy_coef)
         self.entropy_decay = checkpoint.get("entropy_decay", self.entropy_decay)
         self.max_grad_norm = checkpoint.get("max_grad_norm", self.max_grad_norm)
-        logger.info(f"Loaded PPO policy checkpoint from {path}.")
+        logger.info(f"Loaded PPO policy checkpoint from {path} (actions={self.num_actions}, state_dim={self.state_dim}).")
 
 
 # Alias for compatibility with external references
@@ -476,8 +508,10 @@ class SequentialSteeringMDP:
             cost = 0.0
             done = False
             next_state = current_state.clone()
-            # Feature perturbation reflecting chosen site
-            next_state[4] = float(action.layer_idx or 0) / 32.0
+            # Feature perturbation reflecting chosen site (bounds-checked for arbitrary dimensions & shapes)
+            idx_layer = 4 if next_state.shape[-1] > 4 else (next_state.shape[-1] - 1)
+            if idx_layer >= 0:
+                next_state[..., idx_layer] = float(action.layer_idx or 0) / 32.0
             return next_state, reward, cost, done, {"stage": "site_selected", "layer": self.chosen_layer}
 
         elif self.current_step == 2:
@@ -487,7 +521,9 @@ class SequentialSteeringMDP:
             cost = 0.0
             done = False
             next_state = current_state.clone()
-            next_state[7] = 0.8 if "transport" in self.chosen_source else 0.5
+            idx_source = 7 if next_state.shape[-1] > 7 else (next_state.shape[-1] - 1)
+            if idx_source >= 0:
+                next_state[..., idx_source] = 0.8 if "transport" in self.chosen_source else 0.5
             return next_state, reward, cost, done, {"stage": "source_selected", "source": self.chosen_source}
 
         else:

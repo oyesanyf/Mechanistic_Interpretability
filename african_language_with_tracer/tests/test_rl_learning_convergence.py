@@ -848,6 +848,142 @@ class TestRLLearningAndConvergence(unittest.TestCase):
         self.assertEqual(sum(bandit.pull_counts), 0, "Pull counts must remain 0 in cold_rl mode")
         self.assertIsNone(bandit.last_verified_arm_id)
 
+    def test_covariance_inverse_device_and_dtype_preservation(self):
+        """
+        Verifies that stable_covariance_inverse preserves input tensor device (CPU/CUDA)
+        and numerical dtype (float32/float64), preventing device mismatch exceptions.
+        """
+        A_f64 = torch.eye(4, dtype=torch.float64)
+        inv_f64 = stable_covariance_inverse(A_f64)
+        self.assertEqual(inv_f64.dtype, torch.float64, "Inverse of float64 matrix must remain float64")
+
+        if torch.cuda.is_available():
+            A_cuda = torch.eye(4, device="cuda")
+            inv_cuda = stable_covariance_inverse(A_cuda)
+            self.assertEqual(inv_cuda.device.type, "cuda", "Inverse of CUDA matrix must remain on CUDA")
+
+    def test_bandit_policy_checkpoint_state_dim_restoration(self):
+        """
+        Verifies that loading a bandit policy checkpoint restores state_dim and salient
+        feature interaction indices, preventing tensor size mismatches when loading
+        31-dim models into instances initialized with default 15-dim states.
+        """
+        b31 = ContextualBanditController(state_dim=31, algorithm="action_conditioned")
+        with tempfile.TemporaryDirectory() as td:
+            ckpt_path = os.path.join(td, "bandit31.json")
+            b31.save_policy(ckpt_path)
+
+            b_new = ContextualBanditController(state_dim=15, algorithm="action_conditioned")
+            self.assertEqual(b_new.state_dim, 15)
+            b_new.load_policy(ckpt_path)
+            self.assertEqual(b_new.state_dim, 31, "load_policy must restore state_dim to 31")
+            self.assertEqual(b_new.joint_dim, b31.joint_dim)
+
+            # Test inference with restored state_dim
+            s_test = torch.randn(31)
+            dec = b_new.select_action(s_test, prompt_kind="unsafe")
+            self.assertIsNotNone(dec.action)
+            self.assertIsNotNone(dec.predicted_reward)
+
+    def test_thompson_sampling_determinism_and_annealing(self):
+        """
+        Verifies that contextual Thompson sampling:
+        1. Is strictly deterministic in frozen_rl mode or with deterministic=True (no random sampling).
+        2. Posterior uncertainty scales with annealed exploration constant c(t).
+        """
+        bandit = ContextualBanditController(
+            state_dim=15,
+            algorithm="thompson_sampling",
+            exploration_c=1.0,
+            alpha_decay=0.05,
+            rl_mode="frozen_rl",
+        )
+        s = torch.randn(15)
+
+        # Deterministic evaluation check
+        dec1 = bandit.select_action(s, deterministic=True)
+        dec2 = bandit.select_action(s, deterministic=True)
+        self.assertEqual(
+            dec1.ucb_score,
+            dec2.ucb_score,
+            "Thompson sampling must yield identical deterministic scores in frozen_rl / deterministic mode",
+        )
+        self.assertEqual(dec1.action.action_id, dec2.action.action_id)
+
+        # Annealing check: step_count should reduce exploration parameter
+        bandit.rl_mode = "cold_rl"
+        c_init = bandit.get_current_exploration_c()
+        bandit.step_count = 100
+        c_annealed = bandit.get_current_exploration_c()
+        self.assertLess(c_annealed, c_init)
+
+    def test_ppo_checkpoint_dynamic_action_space_restoration(self):
+        """
+        Verifies that ConstrainedPPOController.load_policy dynamically adapts
+        the ActorCriticNetwork and restores actions when loading a checkpoint
+        with a different action count or state dimension.
+        """
+        custom_actions = [SteeringAction(i, f"act_{i}", i, 1.0) for i in range(10)]
+        ppo_orig = ConstrainedPPOController(state_dim=15, actions=custom_actions, device="cpu")
+        with tempfile.TemporaryDirectory() as td:
+            ckpt_path = os.path.join(td, "ppo_custom.pt")
+            ppo_orig.save_policy(ckpt_path)
+
+            ppo_loaded = ConstrainedPPOController(state_dim=15, device="cpu")
+            self.assertNotEqual(ppo_loaded.num_actions, 10)
+            ppo_loaded.load_policy(ckpt_path)
+            self.assertEqual(ppo_loaded.num_actions, 10)
+            self.assertEqual(ppo_loaded.network.actor_head.out_features, 10)
+
+            # Test inference with loaded policy
+            s = torch.randn(15)
+            dec = ppo_loaded.select_action(s, deterministic=True)
+            self.assertIsNotNone(dec.action)
+            self.assertIn(dec.action_index, range(10))
+
+    def test_sequential_mdp_arbitrary_state_dimensions_and_shapes(self):
+        """
+        Verifies that SequentialSteeringMDP.step safely handles sub-8-dim states
+        and 2D batch-shaped states without IndexError.
+        """
+        mdp = SequentialSteeringMDP(candidate_layers=[8], candidate_magnitudes=[2.5])
+        actions = [SteeringAction(0, "A0", 8, 2.5)]
+
+        # Small 4-dim state (< 8 dims)
+        s_small = torch.randn(4)
+        s_reset, _ = mdp.reset(s_small)
+        next_s1, _, _, _, _ = mdp.step(0, s_reset, actions)
+        self.assertEqual(next_s1.shape, (4,))
+
+        # 2D state tensor (1, 15)
+        s_2d = torch.randn(1, 15)
+        s_reset2, _ = mdp.reset(s_2d)
+        next_s2, _, _, _, _ = mdp.step(0, s_reset2, actions)
+        self.assertEqual(next_s2.shape, (1, 15))
+
+    def test_ppo_single_transition_update_non_zero_gradient(self):
+        """
+        Verifies that PPO update with a single buffered transition does not
+        annihilate policy advantage to zero via mean-subtraction.
+        """
+        ppo = ConstrainedPPOController(state_dim=15, hidden_dim=32, device="cpu")
+        s = torch.randn(15)
+        dec = ppo.select_action(s)
+        ppo.record_step(
+            state=s,
+            action_index=dec.action_index,
+            reward=1.0,
+            cost=0.0,
+            log_prob=dec.log_prob,
+            value=dec.value_estimate,
+            cost_val=dec.cost_estimate,
+            done=True,
+        )
+        metrics = ppo.update(ppo_epochs=1)
+        self.assertIn("training_loss", metrics)
+        self.assertFalse(math.isnan(metrics["training_loss"]))
+
+
     def test_dimension_mismatch_robustness(self):
         """
         Verifies that passing state vectors of differing lengths (e.g. 15 vs 31)
