@@ -324,11 +324,25 @@ All 7 arXiv publication figures (28 artifacts across vector PDF and 300-DPI PNG 
 * **Figure 6**: Pareto frontier of Benign Utility Preservation vs. Unsafe Refusal with 2D error bars ($\pm \text{SEM}_x, \pm \text{SEM}_y$).
 * **Figure 7**: Executive 4-panel publication dashboard with SEM uncertainty ribbons and error bars.
 
+### 6. Disentangled Evaluation Regimes & Zero-Leakage Isolation
+To ensure publishable scientific credibility, the auditor enforces strict operational boundaries:
+* **`--rl_eval_mode frozen_test`**: Freezes the controller parameters (`update_policy=False`), completely disallows Part B test-prompt warm-start pseudo-observations, and tests true out-of-distribution generalization.
+* **Three Clean Regimes (`--rl_mode`)**:
+  * `cold_rl`: Contextual bandit/PPO trains from scratch without any Part B prior or warm-start.
+  * `partb_prior_rl`: Pre-initializes policy priors strictly during the *pre-evaluation calibration phase*.
+  * `frozen_rl`: Evaluates a pre-trained serialized policy without taking updates or prompts-specific warm-starts.
+* **Direct Attribution of RL-Added Advantage**: Every prompt intervention is classified into:
+  * `RL > Raw`: Genuine RL-added value ($G_{\text{RL}} > G_{\text{raw}} + 10^{-5}$).
+  * `RL == Raw`: RL matched Part B's verified intervention.
+  * `RL < Raw`: RL underperformed Part B.
+* **Temporal Learning Dynamics**: Tracks early vs. late mean reward ($R_{\text{early}} \to R_{\text{late}}$), early vs. late regret decay, cumulative regret, and % of $\varepsilon$-optimal choices against the counterfactual oracle.
+
 ---
 
-## 📈 Multi-Seed Production Run Command
+## 📈 Production Run Commands
 
-For publication-grade experimental rigor, run with multi-seed execution (`0,1,2,3,4`), higher prompt counts, multi-token sequence likelihood, behavioral generation verification, and Jacobian awakening:
+### 1. Full Multilingual Production Run (One-Liner)
+Deploys the **Action-Conditioned Bandit (31D Rich State + Cross-Product Actions)**, **Hybrid Awakening ($L_2 \le 5.0$)**, **Behavioral Rewards**, **Counterfactual Regret Tracking**, and **ReST-RL Deliberative Tree Search** across all 6 languages:
 
 ```bash
 python african_safety_full_research_auditor_with_circuit_tracer.py \
@@ -337,7 +351,7 @@ python african_safety_full_research_auditor_with_circuit_tracer.py \
   --languages English,Yoruba,Igbo,Hausa,Swahili,Zulu \
   --prompt_scaffolds baseline,tree_safety \
   --include_benign_controls \
-  --repeat_seeds 0,1,2,3,4 \
+  --repeat_seeds 0,1,2 \
   --max_eval_prompts 5 \
   --max_benign_prompts 3 \
   --n_calibration 4 \
@@ -345,11 +359,22 @@ python african_safety_full_research_auditor_with_circuit_tracer.py \
   --target_layers 8,12 \
   --awakening_steps 8 \
   --max_mutation_norm 5.0 \
+  --awakening_loss_type hybrid \
   --enable_jacobian_lens \
   --jacobian_awakening \
   --run_generation_eval \
   --allow_generation_eval_in_must_complete_mode \
   --enable_rl_controller \
+  --rl_policy bandit \
+  --bandit_algorithm action_conditioned \
+  --expanded_action_space \
+  --rich_state \
+  --behavior_reward \
+  --rl_eval_mode train \
+  --rl_mode partb_prior_rl \
+  --counterfactual_eval \
+  --counterfactual_subset_size 5 \
+  --save_policy_path african_safety_research_outputs/checkpoints/policy_trained.pt \
   --enable_rest_rl \
   --rest_rl_mcts_sims 12 \
   --rest_rl_mcts_depth 3 \
@@ -357,6 +382,42 @@ python african_safety_full_research_auditor_with_circuit_tracer.py \
   --no_word_report \
   --clean_out_dir
 ```
+
+### 2. Two-Phase Train -> Freeze -> Held-Out Test Pipeline
+
+#### Phase 1: Train & Save Policy
+```bash
+python african_safety_full_research_auditor_with_circuit_tracer.py \
+  --model HuggingFaceTB/SmolLM2-135M-Instruct \
+  --device cuda \
+  --languages English,Yoruba,Swahili \
+  --prompt_scaffolds baseline \
+  --rl_eval_mode train \
+  --rl_mode cold_rl \
+  --enable_rl_controller \
+  --bandit_algorithm action_conditioned \
+  --rich_state \
+  --save_policy_path checkpoints/african_safety_bandit.pt \
+  --clean_out_dir
+```
+
+#### Phase 2: Reload & Evaluate on Unseen Prompts (Frozen / Zero Updates / Zero Leakage)
+```bash
+python african_safety_full_research_auditor_with_circuit_tracer.py \
+  --model HuggingFaceTB/SmolLM2-135M-Instruct \
+  --device cuda \
+  --languages English,Yoruba,Swahili \
+  --prompt_scaffolds tree_safety \
+  --rl_eval_mode frozen_test \
+  --rl_mode frozen_rl \
+  --enable_rl_controller \
+  --bandit_algorithm action_conditioned \
+  --rich_state \
+  --load_policy_path checkpoints/african_safety_bandit.pt \
+  --no_word_report \
+  --clean_out_dir
+```
+
 
 ---
 
