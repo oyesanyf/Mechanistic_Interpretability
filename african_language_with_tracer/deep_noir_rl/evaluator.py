@@ -42,6 +42,21 @@ class PolicyEvaluationSummary:
     benign_degradation_rate: float = 0.0
     cumulative_reward: float = 0.0
     total_compute_forward_passes: int = 0
+    early_mean_reward: float = 0.0
+    late_mean_reward: float = 0.0
+    early_mean_regret: float = 0.0
+    late_mean_regret: float = 0.0
+    cumulative_regret: float = 0.0
+    pct_epsilon_optimal: float = 0.0
+    early_rollback_rate: float = 0.0
+    late_rollback_rate: float = 0.0
+    action_distribution_shifts: Dict[str, float] = field(default_factory=dict)
+    mean_oracle_reward: float = 0.0
+    mean_oracle_regret: float = 0.0
+    oracle_action_accuracy: float = 0.0
+    unsteered_behavioral_refusal_rate: float = 0.0
+    steered_behavioral_refusal_rate: float = 0.0
+    behavioral_refusal_gain: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -231,7 +246,7 @@ class DeepNoirRLEvaluator:
 
             # 2. Benchmark evaluation loop
             policy_results: List[AdaptiveSteeringResult] = []
-            update_policy = (eval_mode != "frozen_test") and (pol != "frozen_rl")
+            update_policy = (eval_mode not in ("frozen_test", "validation")) and (pol != "frozen_rl")
 
             for item in eval_dataset:
                 enc = self.tokenizer(item["text"], return_tensors="pt").to(self.device)
@@ -264,7 +279,7 @@ class DeepNoirRLEvaluator:
                         prompt_kind=item["prompt_kind"],
                         scaffold_name=item.get("scaffold", "baseline"),
                         update_policy=update_policy,
-                        awakening_results=part_b_results if pol in ("partb_prior_rl", "bandit", "part_b_only") else None,
+                        awakening_results=part_b_results if (eval_mode != "frozen_test" and pol in ("partb_prior_rl", "bandit", "part_b_only")) else None,
                     )
                     if not res.chosen_action.is_no_op:
                         compute_forward_passes += 1  # Steered forward pass
@@ -275,10 +290,95 @@ class DeepNoirRLEvaluator:
                 controller.flush_ppo_updates()
 
             elapsed = time.time() - t0
-            summary = self._summarize_policy_results(pol, policy_results, elapsed, compute_forward_passes)
+            base_unsteered_rate = 0.0
+            if "baseline" in results:
+                base_unsteered_rate = results["baseline"][0].steered_behavioral_refusal_rate
+            summary = self._summarize_policy_results(
+                pol, policy_results, elapsed, compute_forward_passes, unsteered_refusal_rate=base_unsteered_rate
+            )
             results[pol] = (summary, policy_results)
 
         return results
+
+    def compute_temporal_learning_metrics(
+        self,
+        results: List[AdaptiveSteeringResult],
+        epsilon: float = 0.05,
+    ) -> Dict[str, Any]:
+        """
+        Computes temporal learning dynamics across a list of adaptation results:
+        early vs. late reward, early vs. late regret, cumulative regret, % epsilon-optimal,
+        early vs. late rollback rate, and action distribution shifts.
+        """
+        n = len(results)
+        if n == 0:
+            return {
+                "total_episodes": 0,
+                "early_episodes": 0,
+                "late_episodes": 0,
+                "early_mean_reward": 0.0,
+                "late_mean_reward": 0.0,
+                "reward_gain": 0.0,
+                "early_mean_regret": 0.0,
+                "late_mean_regret": 0.0,
+                "regret_reduction": 0.0,
+                "cumulative_regret": 0.0,
+                "pct_epsilon_optimal": 0.0,
+                "early_rollback_rate": 0.0,
+                "late_rollback_rate": 0.0,
+                "rollback_rate_delta": 0.0,
+                "early_action_distribution": {},
+                "late_action_distribution": {},
+                "action_frequency_shifts": {},
+            }
+
+        split_idx = max(1, n // 2)
+        early_r = results[:split_idx]
+        late_r = results[split_idx:] if n > 1 else results
+
+        early_rewards = [r.reward_breakdown.total_reward for r in early_r]
+        late_rewards = [r.reward_breakdown.total_reward for r in late_r]
+        early_mean_rew = float(sum(early_rewards) / len(early_rewards)) if early_rewards else 0.0
+        late_mean_rew = float(sum(late_rewards) / len(late_rewards)) if late_rewards else 0.0
+
+        early_rb = sum(1 for r in early_r if r.was_rolled_back)
+        late_rb = sum(1 for r in late_r if r.was_rolled_back)
+        early_rb_rate = (early_rb / len(early_r) * 100.0) if early_r else 0.0
+        late_rb_rate = (late_rb / len(late_r) * 100.0) if late_r else 0.0
+
+        early_reg = [r.instantaneous_regret for r in early_r if getattr(r, "instantaneous_regret", None) is not None]
+        late_reg = [r.instantaneous_regret for r in late_r if getattr(r, "instantaneous_regret", None) is not None]
+        all_reg = [r.instantaneous_regret for r in results if getattr(r, "instantaneous_regret", None) is not None]
+        early_mean_reg = float(sum(early_reg) / len(early_reg)) if early_reg else 0.0
+        late_mean_reg = float(sum(late_reg) / len(late_reg)) if late_reg else 0.0
+        cum_reg = float(sum(all_reg)) if all_reg else 0.0
+        eps_cnt = sum(1 for r in all_reg if r <= epsilon)
+        pct_eps = float((eps_cnt / len(all_reg) * 100.0)) if all_reg else 0.0
+
+        all_acts = sorted(set(r.chosen_action.name for r in results))
+        early_dist = {a: round(sum(1 for r in early_r if r.chosen_action.name == a) / len(early_r), 4) for a in all_acts}
+        late_dist = {a: round(sum(1 for r in late_r if r.chosen_action.name == a) / len(late_r), 4) for a in all_acts}
+        act_shifts = {a: round(late_dist.get(a, 0.0) - early_dist.get(a, 0.0), 4) for a in all_acts}
+
+        return {
+            "total_episodes": n,
+            "early_episodes": len(early_r),
+            "late_episodes": len(late_r),
+            "early_mean_reward": round(early_mean_rew, 5),
+            "late_mean_reward": round(late_mean_rew, 5),
+            "reward_gain": round(late_mean_rew - early_mean_rew, 5),
+            "early_mean_regret": round(early_mean_reg, 5),
+            "late_mean_regret": round(late_mean_reg, 5),
+            "regret_reduction": round(early_mean_reg - late_mean_reg, 5),
+            "cumulative_regret": round(cum_reg, 5),
+            "pct_epsilon_optimal": round(pct_eps, 2),
+            "early_rollback_rate": round(early_rb_rate, 2),
+            "late_rollback_rate": round(late_rb_rate, 2),
+            "rollback_rate_delta": round(late_rb_rate - early_rb_rate, 2),
+            "early_action_distribution": early_dist,
+            "late_action_distribution": late_dist,
+            "action_frequency_shifts": act_shifts,
+        }
 
     def _summarize_policy_results(
         self,
@@ -286,6 +386,7 @@ class DeepNoirRLEvaluator:
         results: List[AdaptiveSteeringResult],
         elapsed: float,
         compute_forward_passes: int = 0,
+        unsteered_refusal_rate: float = 0.0,
     ) -> PolicyEvaluationSummary:
         n = len(results)
         if n == 0:
@@ -322,6 +423,23 @@ class DeepNoirRLEvaluator:
         rollbacks = sum(1 for r in results if r.was_rolled_back)
         rollback_rate = rollbacks / n
 
+        # Temporal learning metrics
+        temp_metrics = self.compute_temporal_learning_metrics(results)
+
+        # Oracle metrics
+        oracle_rewards = [r.oracle_reward for r in results if getattr(r, "oracle_reward", None) is not None]
+        mean_orc_r = sum(oracle_rewards) / len(oracle_rewards) if oracle_rewards else 0.0
+        oracle_regrets = [r.instantaneous_regret for r in results if getattr(r, "instantaneous_regret", None) is not None]
+        mean_orc_reg = sum(oracle_regrets) / len(oracle_regrets) if oracle_regrets else 0.0
+        orc_matches = sum(1 for r in results if getattr(r, "oracle_action_name", None) is not None and r.oracle_action_name == r.chosen_action.name)
+        orc_acc = (orc_matches / len(oracle_rewards) * 100.0) if oracle_rewards else 0.0
+
+        # Behavioral refusal metrics
+        steered_ref_cnt = sum(1 for r in unsafe_results if getattr(r, "is_behavior_refusal", False))
+        steered_beh_rate = (steered_ref_cnt / len(unsafe_results) * 100.0) if unsafe_results else 0.0
+        unsteered_rate = steered_beh_rate if name == "baseline" else unsteered_refusal_rate
+        beh_gain = steered_beh_rate - unsteered_rate
+
         return PolicyEvaluationSummary(
             policy_name=name,
             num_prompts=n,
@@ -339,6 +457,21 @@ class DeepNoirRLEvaluator:
             benign_degradation_rate=round(degradation_rate, 4),
             cumulative_reward=round(sum(rewards), 4),
             total_compute_forward_passes=compute_forward_passes,
+            early_mean_reward=temp_metrics["early_mean_reward"],
+            late_mean_reward=temp_metrics["late_mean_reward"],
+            early_mean_regret=temp_metrics["early_mean_regret"],
+            late_mean_regret=temp_metrics["late_mean_regret"],
+            cumulative_regret=temp_metrics["cumulative_regret"],
+            pct_epsilon_optimal=temp_metrics["pct_epsilon_optimal"],
+            early_rollback_rate=temp_metrics["early_rollback_rate"],
+            late_rollback_rate=temp_metrics["late_rollback_rate"],
+            action_distribution_shifts=temp_metrics["action_frequency_shifts"],
+            mean_oracle_reward=round(mean_orc_r, 5),
+            mean_oracle_regret=round(mean_orc_reg, 5),
+            oracle_action_accuracy=round(orc_acc, 2),
+            unsteered_behavioral_refusal_rate=round(unsteered_rate, 2),
+            steered_behavioral_refusal_rate=round(steered_beh_rate, 2),
+            behavioral_refusal_gain=round(beh_gain, 2),
         )
 
     def generate_central_ablation_table(

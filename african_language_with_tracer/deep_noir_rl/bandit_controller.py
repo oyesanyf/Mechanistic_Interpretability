@@ -662,6 +662,7 @@ class ContextualBanditController:
             "b": b_serial,
             "A_shared": A_sh_serial,
             "b_shared": b_sh_serial,
+            "cumulative_regret": float(self.cumulative_regret),
         }
         raw_json = json.dumps(payload, sort_keys=True)
         sha = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
@@ -712,14 +713,83 @@ class ContextualBanditController:
         if "max_steering_magnitude" in data:
             self.max_steering_magnitude = data["max_steering_magnitude"]
 
+        dev = self.A[0].device if self.A else torch.device("cpu")
         self.pull_counts = data.get("pull_counts", [0] * self.num_actions)
-        self.A = [torch.tensor(mat, dtype=torch.float32) for mat in data["A"]]
-        self.b = [torch.tensor(vec, dtype=torch.float32) for vec in data["b"]]
+        self.A = [torch.tensor(mat, dtype=torch.float32, device=dev) for mat in data["A"]]
+        self.b = [torch.tensor(vec, dtype=torch.float32, device=dev) for vec in data["b"]]
         if "A_shared" in data and "b_shared" in data:
-            self.A_shared = torch.tensor(data["A_shared"], dtype=torch.float32)
-            self.b_shared = torch.tensor(data["b_shared"], dtype=torch.float32)
+            self.A_shared = torch.tensor(data["A_shared"], dtype=torch.float32, device=dev)
+            self.b_shared = torch.tensor(data["b_shared"], dtype=torch.float32, device=dev)
             self.joint_dim = self.A_shared.shape[0]
+        if "cumulative_regret" in data:
+            self.cumulative_regret = float(data["cumulative_regret"])
 
         if freeze:
             self.rl_mode = "frozen_rl"
         logger.info(f"Loaded bandit policy from {path} (frozen={freeze}, actions={self.num_actions}, state_dim={self.state_dim}).")
+
+    def get_temporal_learning_summary(self, epsilon: float = 0.05) -> Dict[str, Any]:
+        """
+        Computes temporal learning dynamics across the bandit decision trajectory:
+        early vs. late reward, early vs. late regret, cumulative regret, % epsilon-optimal,
+        and action distribution shifts.
+        """
+        steps = self.trajectory
+        n = len(steps)
+        if n == 0:
+            return {
+                "total_episodes": 0,
+                "early_episodes": 0,
+                "late_episodes": 0,
+                "early_mean_reward": 0.0,
+                "late_mean_reward": 0.0,
+                "reward_gain": 0.0,
+                "early_mean_regret": 0.0,
+                "late_mean_regret": 0.0,
+                "regret_reduction": 0.0,
+                "cumulative_regret": 0.0,
+                "pct_epsilon_optimal": 0.0,
+                "early_action_distribution": {},
+                "late_action_distribution": {},
+                "action_frequency_shifts": {},
+            }
+
+        split_idx = max(1, n // 2)
+        early_steps = steps[:split_idx]
+        late_steps = steps[split_idx:] if n > 1 else steps
+
+        early_r = [s["observed_reward"] for s in early_steps if s.get("observed_reward") is not None]
+        late_r = [s["observed_reward"] for s in late_steps if s.get("observed_reward") is not None]
+        early_mean_r = float(sum(early_r) / len(early_r)) if early_r else 0.0
+        late_mean_r = float(sum(late_r) / len(late_r)) if late_r else 0.0
+
+        early_reg = [s["instantaneous_regret"] for s in early_steps if s.get("instantaneous_regret") is not None]
+        late_reg = [s["instantaneous_regret"] for s in late_steps if s.get("instantaneous_regret") is not None]
+        all_reg = [s["instantaneous_regret"] for s in steps if s.get("instantaneous_regret") is not None]
+        early_mean_reg = float(sum(early_reg) / len(early_reg)) if early_reg else 0.0
+        late_mean_reg = float(sum(late_reg) / len(late_reg)) if late_reg else 0.0
+        cum_reg = float(sum(all_reg)) if all_reg else float(self.cumulative_regret)
+        eps_cnt = sum(1 for r in all_reg if r <= epsilon)
+        pct_eps = float((eps_cnt / len(all_reg)) * 100.0) if all_reg else 0.0
+
+        all_actions = sorted(set(s.get("action_name", "") for s in steps if "action_name" in s))
+        early_dist = {a: round(sum(1 for s in early_steps if s.get("action_name") == a) / len(early_steps), 4) for a in all_actions}
+        late_dist = {a: round(sum(1 for s in late_steps if s.get("action_name") == a) / len(late_steps), 4) for a in all_actions}
+        act_shifts = {a: round(late_dist.get(a, 0.0) - early_dist.get(a, 0.0), 4) for a in all_actions}
+
+        return {
+            "total_episodes": n,
+            "early_episodes": len(early_steps),
+            "late_episodes": len(late_steps),
+            "early_mean_reward": round(early_mean_r, 5),
+            "late_mean_reward": round(late_mean_r, 5),
+            "reward_gain": round(late_mean_r - early_mean_r, 5),
+            "early_mean_regret": round(early_mean_reg, 5),
+            "late_mean_regret": round(late_mean_reg, 5),
+            "regret_reduction": round(early_mean_reg - late_mean_reg, 5),
+            "cumulative_regret": round(cum_reg, 5),
+            "pct_epsilon_optimal": round(pct_eps, 2),
+            "early_action_distribution": early_dist,
+            "late_action_distribution": late_dist,
+            "action_frequency_shifts": act_shifts,
+        }
