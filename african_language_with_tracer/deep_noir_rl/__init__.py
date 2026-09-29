@@ -18,17 +18,16 @@ Modules:
 from .hardware_profiler import HardwareProfiler, HardwareProfile, HardwareTier
 from .graduated_rewards import GraduatedRewardEvaluator, GraduatedRewardBreakdown
 from .logit_lens import LogitLensAnalyzer, LogitLensLayerRecord, AntagonistHeadScore, DeepNoirLayerRanking
-from .gradient_attribution import CausalGradientAttributor, GradientActivationAttributor, HeadAttributionScore, ValidatedHeadAttribution
+from .gradient_attribution import CausalGradientAttributor, HeadAttributionScore
 from .contrastive_steering import ContrastiveSteeringManager, SteeringVector
 from .golden_section_search import DeepNoirGoldenSectionSearcher, GoldenSectionSearchResult
 from .state_extractor import RLStateExtractor, ExtractedState
-from .bandit_controller import ContextualBanditController, SteeringAction, BanditDecision, stable_covariance_inverse
-from .ppo_controller import ConstrainedPPOController, PPODecision, PPOSteeringController
+from .bandit_controller import ContextualBanditController, SteeringAction, BanditDecision
+from .ppo_controller import ConstrainedPPOController, PPODecision
 from .controller import AdaptiveSteeringRLController, AdaptiveSteeringResult
 from .evaluator import DeepNoirRLEvaluator, PolicyEvaluationSummary
 
 __all__ = [
-    "stable_covariance_inverse",
     "HardwareProfiler",
     "HardwareProfile",
     "HardwareTier",
@@ -39,9 +38,7 @@ __all__ = [
     "AntagonistHeadScore",
     "DeepNoirLayerRanking",
     "CausalGradientAttributor",
-    "GradientActivationAttributor",
     "HeadAttributionScore",
-    "ValidatedHeadAttribution",
     "ContrastiveSteeringManager",
     "SteeringVector",
     "DeepNoirGoldenSectionSearcher",
@@ -52,7 +49,6 @@ __all__ = [
     "SteeringAction",
     "BanditDecision",
     "ConstrainedPPOController",
-    "PPOSteeringController",
     "PPODecision",
     "AdaptiveSteeringRLController",
     "AdaptiveSteeringResult",
