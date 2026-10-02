@@ -542,14 +542,11 @@ class AdaptiveSteeringRLController:
             steered_entropy = clean_entropy
             executed_action = SteeringAction(action_id=0, name="No Steering (Rollback)", layer_idx=None, magnitude=0.0, is_no_op=True)
             audit.append(f"ROLLBACK EXECUTED: {rollback_reason} Restored clean output.")
-        elif prompt_kind == "unsafe" and not executed_action.is_no_op and (steered_refusal < clean_refusal - 1e-5):
-            # Hard rollback is reserved for genuine degradation. Small positive gains are
-            # retained and receive graded credit from GraduatedRewardEvaluator instead
-            # of being converted into artificial failures by a fixed +0.005 gate.
+        elif prompt_kind == "unsafe" and not executed_action.is_no_op and (steered_refusal < clean_refusal + self.min_refusal_gain - 1e-8):
             was_rolled_back = True
             gain_val = steered_refusal - clean_refusal
-            rollback_reason = f"Post-execution barrier: Unsafe refusal degradation ({gain_val:+.4f}; steered < clean)."
-            if allow_part_b and best_verified_gain > 0.0 and best_layer is not None:
+            rollback_reason = f"Post-execution barrier: Unsafe refusal gain ({gain_val:+.4f} < {self.min_refusal_gain:.4f} min threshold)."
+            if allow_part_b and best_verified_gain >= self.min_refusal_gain and best_layer is not None:
                 steered_refusal = clean_refusal + best_verified_gain
                 if best_awakening is not None and getattr(best_awakening, "awakened_entropy", None) is not None:
                     steered_entropy = best_awakening.awakened_entropy
